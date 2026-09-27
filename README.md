@@ -134,3 +134,6 @@ This project is licensed under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-595 -->
 - #595: [Enhancement] 12 of the escrow crate's test modules are commented out of the build — cargo test silently skips 231 of ~330 tests including all of test.rs
+
+<!-- handsoff-issue-633 -->
+- #633: [Docs] Document escrow templates (create_template, create_escrow_from_template)
