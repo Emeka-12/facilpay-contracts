@@ -477,12 +477,36 @@ mod test {
         // Pausing now targets the new contracts and leaves the old ones untouched.
         client.emergency_pause_all(&pauser, &String::from_str(&env, "rotation"));
 
-        assert!(PaymentContractClient::new(&env, &new_payment).get_pause_state().globally_paused);
-        assert!(EscrowContractClient::new(&env, &new_escrow).get_pause_state().globally_paused);
-        assert!(RefundContractClient::new(&env, &new_refund).get_pause_state().globally_paused);
+        assert!(
+            PaymentContractClient::new(&env, &new_payment)
+                .get_pause_state()
+                .globally_paused
+        );
+        assert!(
+            EscrowContractClient::new(&env, &new_escrow)
+                .get_pause_state()
+                .globally_paused
+        );
+        assert!(
+            RefundContractClient::new(&env, &new_refund)
+                .get_pause_state()
+                .globally_paused
+        );
 
-        assert!(!PaymentContractClient::new(&env, &old_payment).get_pause_state().globally_paused);
-        assert!(!EscrowContractClient::new(&env, &old_escrow).get_pause_state().globally_paused);
-        assert!(!RefundContractClient::new(&env, &old_refund).get_pause_state().globally_paused);
+        assert!(
+            !PaymentContractClient::new(&env, &old_payment)
+                .get_pause_state()
+                .globally_paused
+        );
+        assert!(
+            !EscrowContractClient::new(&env, &old_escrow)
+                .get_pause_state()
+                .globally_paused
+        );
+        assert!(
+            !RefundContractClient::new(&env, &old_refund)
+                .get_pause_state()
+                .globally_paused
+        );
     }
 }
