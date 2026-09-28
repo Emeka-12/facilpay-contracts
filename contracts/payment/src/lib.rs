@@ -1,6 +1,9 @@
 // This contract uses a multi-level enum structure for DataKey and Error to stay within
 // Soroban's 50-variant XDR limit. Each sub-enum must have <= 50 variants.
 #![no_std]
+// Contract entrypoints mirror their on-chain ABI, so argument counts can't be
+// folded into structs without breaking callers.
+#![allow(clippy::too_many_arguments)]
 use escrow::EscrowContractClient;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, xdr::ToXdr, Address,
@@ -308,20 +311,30 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 500 && code <= 540 {
-                return Ok(Error::Feature(unsafe { core::mem::transmute(code) }));
+            if (500..=540).contains(&code) {
+                return Ok(Error::Feature(unsafe {
+                    core::mem::transmute::<u32, FeatureError>(code)
+                }));
             }
-            if code >= 400 && code <= 406 {
-                return Ok(Error::Proposal(unsafe { core::mem::transmute(code) }));
+            if (400..=406).contains(&code) {
+                return Ok(Error::Proposal(unsafe {
+                    core::mem::transmute::<u32, ProposalError>(code)
+                }));
             }
-            if code >= 300 && code <= 318 {
-                return Ok(Error::Subscription(unsafe { core::mem::transmute(code) }));
+            if (300..=318).contains(&code) {
+                return Ok(Error::Subscription(unsafe {
+                    core::mem::transmute::<u32, SubscriptionError>(code)
+                }));
             }
-            if code >= 200 && code <= 224 {
-                return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
+            if (200..=224).contains(&code) {
+                return Ok(Error::Payment(unsafe {
+                    core::mem::transmute::<u32, PaymentError>(code)
+                }));
             }
-            if code >= 100 && code <= 126 {
-                return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
+            if (100..=126).contains(&code) {
+                return Ok(Error::Basic(unsafe {
+                    core::mem::transmute::<u32, BasicError>(code)
+                }));
             }
         }
         Err(error)
@@ -2707,7 +2720,7 @@ impl PaymentContract {
             PayoutFrequency::Weekly => SECONDS_PER_DAY * 7,
             PayoutFrequency::Monthly => SECONDS_PER_DAY * 30,
         };
-        schedule.next_payout_at = schedule.next_payout_at + period;
+        schedule.next_payout_at += period;
         env.storage().instance().set(
             &DataKey::Merchant(MerchantDataKey::PayoutSchedule(merchant)),
             &schedule,
@@ -2798,7 +2811,7 @@ impl PaymentContract {
             created_at: current_timestamp,
             expires_at,
             metadata,
-            notes: String::from_str(&env, ""),
+            notes: String::from_str(env, ""),
             refunded_amount: 0,
         };
 
@@ -2854,7 +2867,7 @@ impl PaymentContract {
                     merchant.clone(),
                     page_num,
                 )))
-                .unwrap_or_else(|| Vec::new(&env));
+                .unwrap_or_else(|| Vec::new(env));
             page.push_back(payment_id);
             env.storage().instance().set(
                 &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(merchant, page_num)),
@@ -3063,7 +3076,7 @@ impl PaymentContract {
             merchant: payment.merchant.clone(),
             amount: payment.amount,
         })
-        .publish(&env);
+        .publish(env);
 
         Ok(payment_id)
     }
@@ -4064,11 +4077,7 @@ impl PaymentContract {
         .publish(env);
 
         // Accrue loyalty points for completed payments if loyalty is configured.
-        PaymentContract::maybe_accrue_loyalty_points(
-            &env,
-            payment.customer.clone(),
-            payment.amount,
-        );
+        PaymentContract::maybe_accrue_loyalty_points(env, payment.customer.clone(), payment.amount);
 
         // Accrue fee rebate for merchant if rebate programme is active
         PaymentContract::maybe_accrue_fee_rebate(
@@ -4109,7 +4118,7 @@ impl PaymentContract {
         merchant.require_auth();
 
         // Validate forward_bps: must be between 1 and 10000
-        if let Err(_) = Self::validate_bps(forward_bps) {
+        if Self::validate_bps(forward_bps).is_err() {
             return Err(Error::Feature(FeatureError::InvalidForwardBps));
         }
 
@@ -4439,7 +4448,7 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidAmount));
         }
 
-        let mut payment = PaymentContract::get_payment(&env, payment_id);
+        let payment = PaymentContract::get_payment(&env, payment_id);
 
         // Check if payment is expired
         if PaymentContract::is_payment_expired(&env, payment_id) {
@@ -4474,7 +4483,7 @@ impl PaymentContract {
 
         // Transfer tokens from customer to contract
         let token_client = token::Client::new(&env, &payment.token);
-        token_client.transfer(&customer, &env.current_contract_address(), &amount);
+        token_client.transfer(&customer, env.current_contract_address(), &amount);
 
         // Create partial payment record
         let remaining = outstanding_balance - amount;
@@ -5305,7 +5314,7 @@ impl PaymentContract {
         let page_num = flat_index / Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
         let page_offset = flat_index % Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
         let page_offset_u32 = page_offset as u32;
-        let mut page: Vec<u64> = env
+        let page: Vec<u64> = env
             .storage()
             .instance()
             .get(&DataKey::Merchant(
@@ -5825,8 +5834,8 @@ impl PaymentContract {
                 subscription_id,
                 sub.amount,
             );
-            if let Err(_) =
-                PaymentContract::check_and_update_spend_limit(&env, &sub.customer, charge_amount)
+            if PaymentContract::check_and_update_spend_limit(&env, &sub.customer, charge_amount)
+                .is_err()
             {
                 return Err(Error::Feature(FeatureError::SpendLimitExceeded));
             }
@@ -5845,7 +5854,7 @@ impl PaymentContract {
             if transfer_ok {
                 sub.payment_count += 1;
                 sub.retry_count = 0;
-                sub.next_payment_at = sub.next_payment_at + sub.interval;
+                sub.next_payment_at += sub.interval;
                 sub.status = SubscriptionStatus::Active;
 
                 if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
@@ -5950,7 +5959,7 @@ impl PaymentContract {
 
         // Skip charge if still within trial period
         if sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at {
-            sub.next_payment_at = sub.next_payment_at + sub.interval;
+            sub.next_payment_at += sub.interval;
             env.storage().instance().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
@@ -5961,8 +5970,8 @@ impl PaymentContract {
         // Check customer spend limit (#282)
         let charge_amount =
             PaymentContract::get_discounted_subscription_amount(&env, subscription_id, sub.amount);
-        if let Err(_) =
-            PaymentContract::check_and_update_spend_limit(&env, &sub.customer, charge_amount)
+        if PaymentContract::check_and_update_spend_limit(&env, &sub.customer, charge_amount)
+            .is_err()
         {
             return Err(Error::Feature(FeatureError::SpendLimitExceeded));
         }
@@ -5993,7 +6002,7 @@ impl PaymentContract {
 
             sub.payment_count += 1;
             sub.retry_count = 0;
-            sub.next_payment_at = sub.next_payment_at + sub.interval;
+            sub.next_payment_at += sub.interval;
 
             // Auto-expire when duration is reached
             if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
@@ -6329,7 +6338,7 @@ impl PaymentContract {
 
         let is_authorized = sub.customer == caller
             || sub.merchant == caller
-            || config.map_or(false, |c| c.admins.contains(&caller));
+            || config.is_some_and(|c| c.admins.contains(&caller));
 
         if !is_authorized {
             return Err(Error::Basic(BasicError::Unauthorized));
@@ -6476,11 +6485,13 @@ impl PaymentContract {
                     return Err(Error::Subscription(SubscriptionError::MerchantPaused));
                 }
 
-                if let Err(_) = PaymentContract::check_and_update_spend_limit(
+                if PaymentContract::check_and_update_spend_limit(
                     &env,
                     &sub.customer,
                     prorated_amount,
-                ) {
+                )
+                .is_err()
+                {
                     return Err(Error::Feature(FeatureError::SpendLimitExceeded));
                 }
 
@@ -7467,12 +7478,12 @@ impl PaymentContract {
             if max_amt > 0 && current_amount + amount > max_amt {
                 return false;
             }
-            return true;
+            true
         } else {
             if max_amt > 0 && amount > max_amt {
                 return false;
             }
-            return true;
+            true
         }
     }
 
@@ -8252,7 +8263,7 @@ impl PaymentContract {
         }
 
         // Validate waiver_bps is between 0 and 10000 (100%)
-        if let Err(_) = Self::validate_bps(waiver_bps) {
+        if Self::validate_bps(waiver_bps).is_err() {
             return Err(Error::Basic(BasicError::InvalidTierThresholds));
         }
 
@@ -8393,9 +8404,7 @@ impl PaymentContract {
         // Get waiver discount
         let waiver = PaymentContract::get_fee_waiver(env.clone(), merchant);
         if let Some(w) = waiver {
-            let waiver_adjusted_bps =
-                tier_adjusted_bps - (tier_adjusted_bps * w.waiver_bps) / 10000;
-            waiver_adjusted_bps
+            tier_adjusted_bps - (tier_adjusted_bps * w.waiver_bps) / 10000
         } else {
             tier_adjusted_bps
         }
@@ -9020,7 +9029,7 @@ impl PaymentContract {
             }
         }
         // Rough estimate: base cost + per entry + per group
-        1000 + (entries.len() as u32) * 500 + (groups.len() as u32) * 300
+        1000 + entries.len() * 500 + groups.len() * 300
     }
 
     /// Creates a conditional payment that is only completed when a specified condition is met.
@@ -10265,7 +10274,7 @@ impl PaymentContract {
         }
 
         // Create escrow using the escrow contract
-        let escrow_client = EscrowContractClient::new(&env, &rule.escrow_contract);
+        let escrow_client = EscrowContractClient::new(env, &rule.escrow_contract);
         let release_timestamp = env.ledger().timestamp() + 86400 * 30; // 30 days
         let expiry_timestamp = release_timestamp + 86400 * 7;
         let escrow_id = escrow_client.create_escrow(
@@ -10293,7 +10302,7 @@ impl PaymentContract {
             amount: payment.amount,
             escrow_amount,
         })
-        .publish(&env);
+        .publish(env);
 
         Ok(())
     }
@@ -10537,7 +10546,7 @@ impl PaymentContract {
         (LargePaymentApproved {
             payment_id,
             approver,
-            approval_count: proposal.approvals.len() as u32,
+            approval_count: proposal.approvals.len(),
         })
         .publish(&env);
 
@@ -10932,7 +10941,7 @@ impl PaymentContract {
     pub fn calculate_risk_score(
         env: Env,
         customer: Address,
-        merchant: Address,
+        _merchant: Address,
         amount: i128,
         currency: Currency,
     ) -> u32 {
@@ -11289,7 +11298,7 @@ impl PaymentContract {
         signature: BytesN<64>,
     ) -> Result<(), Error> {
         Self::require_not_paused(&env, "settle_channel")?;
-        
+
         let mut channel: PaymentChannel = env
             .storage()
             .instance()
@@ -11440,17 +11449,6 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))
-    }
-
-    fn extract_public_key(env: &Env, address: &Address) -> BytesN<32> {
-        let xdr = address.to_xdr(env);
-        // ScVal XDR layout: [0,0,0,18](ScvAddress) [0,0,0,0](Account) [0,0,0,0](Ed25519) [32 bytes PK]
-        // PK starts at offset 12
-        let mut pk = [0u8; 32];
-        for i in 0..32 {
-            pk[i] = xdr.get(12 + (i as u32)).unwrap();
-        }
-        BytesN::from_array(env, &pk)
     }
 
     fn is_zero_address(env: &Env, address: &Address) -> bool {
@@ -11612,7 +11610,10 @@ impl PaymentContract {
                 .unwrap_or_else(|| Vec::new(&env));
             page.push_back(payment_id);
             env.storage().instance().set(
-                &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(merchant.clone(), page_num)),
+                &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                    merchant.clone(),
+                    page_num,
+                )),
                 &page,
             );
         }
@@ -11829,10 +11830,9 @@ impl PaymentContract {
 
         // Mark payment as Completed to prevent subsequent complete_payment calls
         payment.status = PaymentStatus::Completed;
-        env.storage().instance().set(
-            &DataKey::Payment(PaymentKey::Data(payment_id)),
-            &payment,
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
 
         Ok(())
     }
@@ -12746,7 +12746,7 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        let mut tags: Vec<BytesN<32>> = env
+        let tags: Vec<BytesN<32>> = env
             .storage()
             .persistent()
             .get(&DataKey::Payment(PaymentKey::Tag(payment_id)))
@@ -12922,7 +12922,7 @@ impl PaymentContract {
     }
 
     fn validate_bps(bps: u32) -> Result<(), Error> {
-        if bps < 1 || bps > 10000 {
+        if !(1..=10000).contains(&bps) {
             return Err(Error::Basic(BasicError::InvalidBps));
         };
 

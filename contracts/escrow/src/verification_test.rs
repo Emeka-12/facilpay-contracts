@@ -6,7 +6,14 @@ use soroban_sdk::{
     token, Address, Env,
 };
 
-fn setup() -> (Env, EscrowContractClient<'static>, Address, Address, Address, Address) {
+fn setup() -> (
+    Env,
+    EscrowContractClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(EscrowContract, ());
@@ -15,7 +22,9 @@ fn setup() -> (Env, EscrowContractClient<'static>, Address, Address, Address, Ad
     client.initialize(&admin);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let token_admin = token::StellarAssetClient::new(&env, &token);
     token_admin.mint(&customer, &1_000_000);
     (env, client, admin, customer, merchant, token)
@@ -28,8 +37,9 @@ fn test_is_escrow_released_false_on_locked_escrow() {
     let (env, client, _admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
 
     assert!(!client.is_escrow_released(&escrow_id));
 }
@@ -39,8 +49,9 @@ fn test_is_escrow_released_true_after_release() {
     let (env, client, admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(2000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
     client.release_escrow(&admin, &escrow_id, &false);
 
     assert!(client.is_escrow_released(&escrow_id));
@@ -59,8 +70,9 @@ fn test_is_escrow_disputed_false_on_locked_escrow() {
     let (env, client, _admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
 
     assert!(!client.is_escrow_disputed(&escrow_id));
 }
@@ -70,8 +82,9 @@ fn test_is_escrow_disputed_true_after_dispute() {
     let (env, client, _admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
     client.dispute_escrow(&customer, &escrow_id);
 
     assert!(client.is_escrow_disputed(&escrow_id));
@@ -90,8 +103,9 @@ fn test_get_escrow_status_locked() {
     let (env, client, _admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
 
     assert_eq!(client.get_escrow_status(&escrow_id), EscrowStatus::Locked);
 }
@@ -101,8 +115,9 @@ fn test_get_escrow_status_released() {
     let (env, client, admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(2000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
     client.release_escrow(&admin, &escrow_id, &false);
 
     assert_eq!(client.get_escrow_status(&escrow_id), EscrowStatus::Released);
@@ -113,8 +128,9 @@ fn test_get_escrow_status_disputed() {
     let (env, client, _admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
     client.dispute_escrow(&customer, &escrow_id);
 
     assert_eq!(client.get_escrow_status(&escrow_id), EscrowStatus::Disputed);
@@ -125,8 +141,9 @@ fn test_get_escrow_status_resolved() {
     let (env, client, admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
     client.dispute_escrow(&customer, &escrow_id);
     // release_to_merchant=false → funds go to customer → status becomes Resolved
     client.resolve_dispute(&admin, &escrow_id, &false);
@@ -148,8 +165,9 @@ fn test_get_escrow_parties_returns_correct_addresses() {
     let (env, client, _admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
 
     let (returned_customer, returned_merchant) = client.get_escrow_parties(&escrow_id);
     assert_eq!(returned_customer, customer);
@@ -170,8 +188,9 @@ fn test_get_escrow_amount_returns_correct_value() {
     let (env, client, _admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &2500_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &2500_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
 
     assert_eq!(client.get_escrow_amount(&escrow_id), 2500_i128);
 }
@@ -190,8 +209,9 @@ fn test_verify_escrow_participant_customer_returns_true() {
     let (env, client, _admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
 
     assert!(client.verify_escrow_participant(&escrow_id, &customer));
 }
@@ -201,8 +221,9 @@ fn test_verify_escrow_participant_merchant_returns_true() {
     let (env, client, _admin, customer, merchant, token) = setup();
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
 
     assert!(client.verify_escrow_participant(&escrow_id, &merchant));
 }
@@ -213,8 +234,9 @@ fn test_verify_escrow_participant_unrelated_address_returns_false() {
     let unrelated = Address::generate(&env);
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64, &0_u64, &false,
+    );
 
     assert!(!client.verify_escrow_participant(&escrow_id, &unrelated));
 }
@@ -225,4 +247,3 @@ fn test_verify_escrow_participant_nonexistent_id_returns_false() {
     let address = Address::generate(&env);
     assert!(!client.verify_escrow_participant(&9999_u64, &address));
 }
-

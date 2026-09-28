@@ -7,6 +7,8 @@ This contract manages secure, conditional fund holding for the Facil-Pay ecosyst
 - create_escrow: Initializes a new escrow agreement with locked funds, terms, and designated participants.
 - release_escrow: Releases the held funds to the recipient once the agreed-upon conditions are successfully met.
 - dispute_escrow: Flags the escrow transaction for administrative arbitration if participants cannot reach a consensus.
+- withdraw_dispute: Lets the party that opened a dispute withdraw it before resolution, returning the escrow to `Locked` and refunding any dispute collateral.
+- set_token_escrow_fee_config: Admin-only. Sets a fee config for one token that overrides the global escrow fee config.
 - clawback: Admin-only emergency fund recovery. Initiates, executes, or cancels a time-delayed transfer of escrow funds to the admin address.
 - approve_multisig: Records an approval signature from a required participant for multi-signature escrow setups.
 - add_observer: Assigns a read-only role to a specific address for auditing and compliance tracking.
@@ -24,6 +26,93 @@ The escrow dispute flow has two separate timeout paths, and they apply in differ
 - Appeal expiry applies only after the dispute has entered the Appeal round. An appeal can be filed only while the dispute round is not Final and the time since `dispute_started_at` is still within the 72-hour appeal window. The appeal stores `appeal_deadline = filed_at + 259200`, and if that deadline passes without a resolution, `expire_appeal` rejects the pending appeal, advances the dispute round to Final, and leaves the prior outcome as the effective final disposition.
 
 These are distinct timers rather than one combined timeout. Escalation timeout is measured from the escalation timestamp on a disputed escrow, while appeal expiry is measured from the appeal filing deadline in the Appeal round. In practice, they are not both expected to fire for the same dispute state: the escalation path resolves the Disputed state before a valid appeal round is entered, and the appeal-expiry path only exists once an appeal has already been filed.
+
+---
+
+## Withdrawing a Dispute
+
+If the parties settle privately after a dispute is opened, the party that opened it can withdraw it instead of waiting for admin resolution.
+
+```
+withdraw_dispute(caller, escrow_id) -> ()
+```
+
+| Parameter   | Type      | Description                                                     |
+| ----------- | --------- | --------------------------------------------------------------- |
+| `caller`    | `Address` | The party that called `dispute_escrow`. Must authorize the call. |
+| `escrow_id` | `u64`     | The disputed escrow.                                            |
+
+On success:
+
+- The escrow status returns from `Disputed` to `Locked`. It can then be released, refunded, or disputed again as normal.
+- `evidence_deadline` and `escalated_at` are cleared, `escalation_level` is reset to `0`, and any pending escalation deadline is removed from the escalation queue, so the dispute cannot be auto-resolved later.
+- If collateral was deposited under `DisputeConfig`, the full amount is transferred back to the disputing party and the collateral record is removed.
+- Dispute analytics (`total_disputes`) are not rolled back, and evidence already submitted stays on record.
+
+Only the opener can withdraw. The counterparty, admins, and observers cannot. If the escrow is disputed again after a withdrawal, the new opener owns that dispute. Disputes opened before this function existed are attributed to the `disputing_party` on their collateral record, if one exists.
+
+### Errors
+
+| Error                       | Cause                                                                                           |
+| --------------------------- | ----------------------------------------------------------------------------------------------- |
+| `EscrowError::NotFound`     | The escrow does not exist                                                                       |
+| `ActionError::NotDisputed`  | The escrow is not currently `Disputed`, including disputes already resolved (`Released`/`Resolved`) |
+| `BasicError::Unauthorized`  | `caller` did not open the dispute                                                               |
+| `BasicError::ContractPaused`| The contract or `withdraw_dispute` is paused                                                    |
+
+### Events
+
+| Event                | Fields                                                  | When                                           |
+| -------------------- | ------------------------------------------------------- | ---------------------------------------------- |
+| `DisputeWithdrawn`   | `escrow_id`, `withdrawn_by`, `collateral_returned`      | Always on success (`collateral_returned` may be `0`) |
+| `CollateralReturned` | `escrow_id`, `party`, `amount`                          | Only when dispute collateral was held          |
+
+---
+
+## Per-Token Fee Configuration
+
+`set_escrow_fee_config` sets one global fee for every token. Since fee economics differ between tokens (for example XLM and USDC), an admin can override the global config for a specific token.
+
+```
+set_token_escrow_fee_config(admin, token, config) -> ()
+remove_token_escrow_fee_config(admin, token) -> ()
+get_token_escrow_fee_config(token) -> Option<EscrowFeeConfig>
+get_effective_escrow_fee_config(token) -> EscrowFeeConfig
+```
+
+| Parameter | Type              | Description                                                               |
+| --------- | ----------------- | ------------------------------------------------------------------------- |
+| `admin`   | `Address`         | A multisig admin. Must authorize the call.                                |
+| `token`   | `Address`         | The token contract the override applies to.                               |
+| `config`  | `EscrowFeeConfig` | `fee_bps` (`0..=10000`), `fee_recipient`, and `enabled` for this token.   |
+
+### Precedence
+
+Fee lookups use the token-specific config if one is set, otherwise the global config. The override replaces the global config entirely for that token, so an override with `enabled: false` means no fee for that token even when the global config is enabled.
+
+- **Fee rate**: resolved when the escrow is created and snapshotted into `Escrow.fee_bps`. Changing either config later does not re-price existing escrows.
+- **Fee recipient**: resolved from the effective config for the escrow's token when fees are paid out at release.
+
+`remove_token_escrow_fee_config` deletes the override, and the token falls back to the global config. `get_effective_escrow_fee_config` returns whichever config currently applies to a token.
+
+### Accumulated fees
+
+When the effective `fee_recipient` is the escrow contract itself, collected fees are accrued per token. `get_accumulated_escrow_fees(token)` returns the balance for that token only, and `withdraw_escrow_fees(admin, token, to)` withdraws only that token's balance. When the recipient is an external address, fees are transferred directly and are not accrued.
+
+### Errors
+
+| Error                        | Cause                                                        |
+| ---------------------------- | ------------------------------------------------------------ |
+| `BasicError::NotAnAdmin`     | Caller is not in the multisig admin set (set and remove)     |
+| `BasicError::InvalidBps`     | `config.fee_bps` is outside `0..=10000` (set)                |
+| `BasicError::ContractPaused` | The contract or the function is paused                       |
+
+### Events
+
+| Event                         | Fields                         | Emitted by                        |
+| ----------------------------- | ------------------------------ | --------------------------------- |
+| `TokenEscrowFeeConfigUpdated` | `token`, `fee_bps`, `enabled`  | `set_token_escrow_fee_config`     |
+| `TokenEscrowFeeConfigRemoved` | `token`                        | `remove_token_escrow_fee_config`  |
 
 ---
 

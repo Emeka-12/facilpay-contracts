@@ -341,7 +341,7 @@ to request again.
 Unavailable arbitrators are skipped by `escalate_to_arbitration`, `auto_assign_arbitrators` and `get_next_arbitrators`, and `assign_arbitrator` rejects them with `ArbitratorUnavailable` (61). They keep their seats and votes on cases they are already assigned to.
 
 - `set_arbitrator_availability()` — Arbitrator opts in or out of new case assignments.
-- `admin_set_arbitrator_availability()` — Admin overrides an arbitrator's availability.
+- `override_arbitrator_availability()` — Admin overrides an arbitrator's availability.
 - `is_arbitrator_available()` — Returns whether a registered arbitrator accepts new cases.
 - `get_available_arbitrators()` — Lists registered arbitrators currently accepting cases.
 
