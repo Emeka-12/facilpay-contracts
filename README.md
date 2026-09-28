@@ -128,3 +128,12 @@ This project is licensed under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-576 -->
 - #576: [Enhancement] Pause enforcement covers only 5 of the refund contract's state-changing entry points — arbitration, vouchers, batch ops, and admin override bypass it entirely
+
+<!-- handsoff-issue-440 -->
+- #440: [Docs] Document RefundReasonCode enum values and when to use each
+
+<!-- handsoff-issue-595 -->
+- #595: [Enhancement] 12 of the escrow crate's test modules are commented out of the build — cargo test silently skips 231 of ~330 tests including all of test.rs
+
+<!-- handsoff-issue-633 -->
+- #633: [Docs] Document escrow templates (create_template, create_escrow_from_template)
