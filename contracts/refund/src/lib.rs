@@ -113,6 +113,8 @@ pub enum ArbitrationKey {
     // Uniqueness guard: maps refund_id -> case_id so the same refund
     // cannot be escalated into multiple parallel arbitration cases.
     CaseByRefund(u64),
+    // Present (true) while an arbitrator has opted out of new case assignments.
+    ArbitratorUnavailable(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -308,6 +310,11 @@ pub enum ExtError {
     // Issue #389: two-step admin rotation errors
     NoPendingAdmin = 59,
     NotPendingAdmin = 60,
+    // Arbitrator availability toggle
+    ArbitratorUnavailable = 61,
+    // Merchant response SLA auto-approval
+    SlaNotConfigured = 62,
+    SlaNotBreached = 63,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1219,6 +1226,11 @@ pub enum RefundExtKey {
     AssignmentConfig,
     RotationIndex,
     RefundTTLConfig,
+    // Merchant response SLA: platform default, per-merchant override, and the
+    // deadline snapshotted onto each refund when it is created.
+    ResponseSlaConfig,
+    MerchantResponseSla(Address),
+    RefundSlaDeadline(u64),
 }
 
 // Issue #195: Batch decision types
@@ -1289,6 +1301,45 @@ pub struct ArbitratorAssignmentConfig {
 pub struct RefundTTLConfig {
     pub default_ttl_seconds: u64,
     pub active: bool,
+}
+
+// Merchant response SLA: if a refund sits in `Requested` longer than
+// `response_sla_seconds`, anyone may trigger its auto-approval.
+#[derive(Clone)]
+#[contracttype]
+pub struct ResponseSlaConfig {
+    pub response_sla_seconds: u64,
+    pub active: bool,
+}
+
+/// Event emitted when a refund is auto-approved because the merchant missed
+/// the response SLA.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundSlaAutoApproved {
+    pub refund_id: u64,
+    pub merchant: Address,
+    pub sla_deadline: u64,
+    pub approved_at: u64,
+}
+
+/// Event emitted when the response SLA configuration changes. `merchant` is
+/// `None` for the platform default.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResponseSlaUpdated {
+    pub merchant: Option<Address>,
+    pub response_sla_seconds: u64,
+    pub active: bool,
+}
+
+/// Event emitted when an arbitrator toggles availability for new cases.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorAvailabilityChanged {
+    pub arbitrator: Address,
+    pub available: bool,
+    pub changed_by: Address,
 }
 
 /// Event emitted when platform fee is deducted from a refund
@@ -2596,6 +2647,9 @@ impl RefundContract {
         if !arbitrators.contains(&arbitrator) {
             return Err(Error::Core(CoreError::NotArbitrator));
         }
+        if !Self::is_arbitrator_available_inner(&env, &arbitrator) {
+            return Err(Error::Ext(ExtError::ArbitratorUnavailable));
+        }
 
         if !case.arbitrators.contains(&arbitrator) {
             case.arbitrators.push_back(arbitrator);
@@ -2679,11 +2733,7 @@ impl RefundContract {
             .unwrap_or(0);
         let case_id = counter + 1;
 
-        let arbitrators = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators = Self::available_arbitrators(&env);
         if arbitrators.len() < 3 {
             return Err(Error::Core(CoreError::QuorumNotReached));
         }
@@ -5669,6 +5719,17 @@ impl RefundContract {
             .set(&DataKey::RefundCounter, &refund_id);
         Self::add_to_status_index(&env, initial_status.clone(), refund_id);
 
+        // Snapshot the merchant response SLA deadline so later config changes
+        // don't retroactively move it.
+        if initial_status == RefundStatus::Requested {
+            if let Some(sla_seconds) = Self::effective_response_sla_seconds(&env, &merchant) {
+                let deadline = env.ledger().timestamp().saturating_add(sla_seconds);
+                env.storage()
+                    .instance()
+                    .set(&RefundExtKey::RefundSlaDeadline(refund_id), &deadline);
+            }
+        }
+
         let merchant_count: u64 = env
             .storage()
             .instance()
@@ -6239,6 +6300,83 @@ impl RefundContract {
             RefundReasonCode::CustomerRequest => 4,
             RefundReasonCode::Other => 5,
         }
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if *admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        Ok(())
+    }
+
+    fn effective_response_sla_seconds(env: &Env, merchant: &Address) -> Option<u64> {
+        let cfg: Option<ResponseSlaConfig> = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::MerchantResponseSla(merchant.clone()))
+            .or_else(|| env.storage().instance().get(&RefundExtKey::ResponseSlaConfig));
+        cfg.filter(|c| c.active && c.response_sla_seconds > 0)
+            .map(|c| c.response_sla_seconds)
+    }
+
+    fn is_registered_arbitrator(env: &Env, arbitrator: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<ArbitrationKey, Vec<Address>>(&ArbitrationKey::ArbitratorList)
+            .map(|list| list.contains(arbitrator))
+            .unwrap_or(false)
+    }
+
+    fn is_arbitrator_available_inner(env: &Env, arbitrator: &Address) -> bool {
+        !env.storage()
+            .instance()
+            .has(&ArbitrationKey::ArbitratorUnavailable(arbitrator.clone()))
+    }
+
+    fn available_arbitrators(env: &Env) -> Vec<Address> {
+        let all: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorList)
+            .unwrap_or(Vec::new(env));
+        let mut available = Vec::new(env);
+        for a in all.iter() {
+            if Self::is_arbitrator_available_inner(env, &a) {
+                available.push_back(a);
+            }
+        }
+        available
+    }
+
+    fn set_arbitrator_availability_inner(
+        env: &Env,
+        arbitrator: &Address,
+        available: bool,
+        changed_by: &Address,
+    ) -> Result<(), Error> {
+        if !Self::is_registered_arbitrator(env, arbitrator) {
+            return Err(Error::Core(CoreError::NotArbitrator));
+        }
+        let key = ArbitrationKey::ArbitratorUnavailable(arbitrator.clone());
+        if available {
+            env.storage().instance().remove(&key);
+        } else {
+            env.storage().instance().set(&key, &true);
+        }
+
+        ArbitratorAvailabilityChanged {
+            arbitrator: arbitrator.clone(),
+            available,
+            changed_by: changed_by.clone(),
+        }
+        .publish(env);
+        Ok(())
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
@@ -7878,11 +8016,7 @@ impl RefundContract {
             .get(&RefundExtKey::AssignmentConfig)
             .ok_or(Error::Core(CoreError::PolicyNotFound))?;
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators = Self::available_arbitrators(&env);
 
         if arbitrators.is_empty() {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -7936,11 +8070,7 @@ impl RefundContract {
             None => return Vec::new(&env),
         };
 
-        let arbitrators: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&ArbitrationKey::ArbitratorList)
-            .unwrap_or(Vec::new(&env));
+        let arbitrators = Self::available_arbitrators(&env);
 
         let total = arbitrators.len() as u32;
         if total == 0 || count == 0 {
@@ -8110,6 +8240,263 @@ impl RefundContract {
         }
 
         results
+    }
+
+    // ── Merchant response SLA auto-approval ───────────────────────────────
+
+    /// Configure the platform-wide merchant response SLA.
+    ///
+    /// Refunds created while the SLA is active get a response deadline of
+    /// `requested_at + response_sla_seconds`. If the refund is still `Requested`
+    /// after that deadline, anyone may call `auto_approve_on_sla_breach`.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin.
+    /// * `response_sla_seconds` - Seconds a merchant has to respond.
+    /// * `active` - Whether the SLA applies to newly created refunds.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    /// Returns `InvalidAmount` if `active` is true and `response_sla_seconds` is zero.
+    pub fn set_response_sla_config(
+        env: Env,
+        admin: Address,
+        response_sla_seconds: u64,
+        active: bool,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if active && response_sla_seconds == 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        let cfg = ResponseSlaConfig {
+            response_sla_seconds,
+            active,
+        };
+        env.storage()
+            .instance()
+            .set(&RefundExtKey::ResponseSlaConfig, &cfg);
+
+        ResponseSlaUpdated {
+            merchant: None,
+            response_sla_seconds,
+            active,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Get the platform-wide merchant response SLA configuration, if set.
+    pub fn get_response_sla_config(env: Env) -> Option<ResponseSlaConfig> {
+        env.storage()
+            .instance()
+            .get(&RefundExtKey::ResponseSlaConfig)
+    }
+
+    /// Override the response SLA for a single merchant.
+    ///
+    /// A per-merchant override takes precedence over the platform default,
+    /// including disabling the SLA for that merchant with `active = false`.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    /// Returns `InvalidAmount` if `active` is true and `response_sla_seconds` is zero.
+    pub fn set_merchant_response_sla(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        response_sla_seconds: u64,
+        active: bool,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if active && response_sla_seconds == 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        let cfg = ResponseSlaConfig {
+            response_sla_seconds,
+            active,
+        };
+        env.storage()
+            .instance()
+            .set(&RefundExtKey::MerchantResponseSla(merchant.clone()), &cfg);
+
+        ResponseSlaUpdated {
+            merchant: Some(merchant),
+            response_sla_seconds,
+            active,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Remove a merchant's SLA override so the platform default applies again.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    pub fn remove_merchant_response_sla(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .remove(&RefundExtKey::MerchantResponseSla(merchant));
+        Ok(())
+    }
+
+    /// Get the effective response SLA in seconds for a merchant, or `None` if
+    /// no active SLA applies.
+    pub fn get_merchant_response_sla(env: Env, merchant: Address) -> Option<u64> {
+        Self::effective_response_sla_seconds(&env, &merchant)
+    }
+
+    /// Get the merchant response deadline recorded for a refund, if any.
+    pub fn get_refund_sla_deadline(env: Env, refund_id: u64) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&RefundExtKey::RefundSlaDeadline(refund_id))
+    }
+
+    /// Auto-approve a refund whose merchant missed the response SLA.
+    ///
+    /// Permissionless: any caller (customer, keeper bot, etc.) may trigger it
+    /// once the deadline has passed. The refund moves from `Requested` to
+    /// `Approved` with the contract itself recorded as the approver.
+    ///
+    /// # Arguments
+    /// * `refund_id` - The ID of the refund to auto-approve.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `InvalidStatus` if the refund is no longer `Requested`.
+    /// Returns `SlaNotConfigured` if no SLA deadline was recorded for the refund.
+    /// Returns `SlaNotBreached` if the deadline has not yet passed.
+    /// Returns `RefundWindowExpired` if the refund's TTL expired first.
+    pub fn auto_approve_on_sla_breach(env: Env, refund_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "auto_approve_on_sla_breach")?;
+
+        let refund = Self::get_refund(&env, refund_id)?;
+        if refund.status != RefundStatus::Requested {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+
+        let deadline: u64 = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::RefundSlaDeadline(refund_id))
+            .ok_or(Error::Ext(ExtError::SlaNotConfigured))?;
+
+        let now = env.ledger().timestamp();
+        if now < deadline {
+            return Err(Error::Ext(ExtError::SlaNotBreached));
+        }
+
+        Self::approve_refund_internal(&env, env.current_contract_address(), refund_id)?;
+        env.storage()
+            .instance()
+            .remove(&RefundExtKey::RefundSlaDeadline(refund_id));
+
+        RefundSlaAutoApproved {
+            refund_id,
+            merchant: refund.merchant,
+            sla_deadline: deadline,
+            approved_at: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Get refund IDs still in `Requested` status whose response SLA has passed.
+    ///
+    /// # Arguments
+    /// * `limit` - Maximum number of refund IDs to return.
+    pub fn get_sla_breached_refunds(env: Env, limit: u32) -> Vec<u64> {
+        let now = env.ledger().timestamp();
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundCounter)
+            .unwrap_or(0);
+
+        let mut results = Vec::new(&env);
+        let mut id = 1u64;
+
+        while id <= total && results.len() < limit {
+            if let Some(deadline) = env
+                .storage()
+                .instance()
+                .get::<RefundExtKey, u64>(&RefundExtKey::RefundSlaDeadline(id))
+            {
+                if now >= deadline {
+                    if let Some(refund) = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, Refund>(&DataKey::Refund(id))
+                    {
+                        if refund.status == RefundStatus::Requested {
+                            results.push_back(id);
+                        }
+                    }
+                }
+            }
+            id += 1;
+        }
+
+        results
+    }
+
+    // ── Arbitrator availability toggle ────────────────────────────────────
+
+    /// Toggle whether an arbitrator accepts new case assignments.
+    ///
+    /// Unavailable arbitrators are skipped when a case is escalated, when
+    /// panels are auto-assigned, and cannot be manually assigned. It does not
+    /// remove them from cases they are already on, so they can still vote there.
+    ///
+    /// # Arguments
+    /// * `arbitrator` - The registered arbitrator (must authorize).
+    /// * `available` - `true` to accept new cases, `false` to opt out.
+    ///
+    /// # Errors
+    /// Returns `NotArbitrator` if the address is not a registered arbitrator.
+    pub fn set_arbitrator_availability(
+        env: Env,
+        arbitrator: Address,
+        available: bool,
+    ) -> Result<(), Error> {
+        arbitrator.require_auth();
+        Self::set_arbitrator_availability_inner(&env, &arbitrator, available, &arbitrator)
+    }
+
+    /// Admin override for an arbitrator's availability (e.g. an arbitrator who
+    /// has gone unresponsive).
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    /// Returns `NotArbitrator` if the address is not a registered arbitrator.
+    pub fn admin_set_arbitrator_availability(
+        env: Env,
+        admin: Address,
+        arbitrator: Address,
+        available: bool,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        Self::set_arbitrator_availability_inner(&env, &arbitrator, available, &admin)
+    }
+
+    /// Returns whether a registered arbitrator is accepting new cases.
+    /// Returns `false` for addresses that are not registered arbitrators.
+    pub fn is_arbitrator_available(env: Env, arbitrator: Address) -> bool {
+        Self::is_registered_arbitrator(&env, &arbitrator)
+            && Self::is_arbitrator_available_inner(&env, &arbitrator)
+    }
+
+    /// Get all registered arbitrators currently accepting new cases.
+    pub fn get_available_arbitrators(env: Env) -> Vec<Address> {
+        Self::available_arbitrators(&env)
     }
 
     // ── Issue #190: Dispute evidence attachment ────────────────────────────
