@@ -44,6 +44,8 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 ### Core Refund Lifecycle
 
 - `request_refund()` — Merchant initiates a refund request with reason and reason code.
+- `amend_refund_request()` — Merchant corrects the amount, reason or reason code of a request still in `Requested` status (see [Refund Request Amendments](#refund-request-amendments)).
+- `get_refund_amendment_count()` — Number of times a refund request has been amended.
 - `get_refund()` — Retrieves a refund record by its ID.
 - `approve_refund()` — Admin approves a refund (moves from Requested to Approved).
 - `reject_refund()` — Admin rejects a refund (moves from Requested to PendingAppeal).
@@ -137,6 +139,7 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `get_refund_count_by_status()` — Gets the count of refunds in a given status.
 - `get_merchant_refunds()` — Paginated refunds for a specific merchant.
 - `get_merchant_refunds_by_status()` — Paginated refunds for a merchant filtered by status.
+- `get_merchant_refunds_in_range(merchant, from, to, limit, offset)` — Paginated refunds for a merchant whose `requested_at` falls in `[from, to]` (inclusive ledger timestamps), in request order. Returns `InvalidDateRange` (66) if `from > to`.
 - `get_merchant_pending_refunds()` — All pending refunds for a merchant.
 - `get_merchant_refund_summary()` — Aggregate refund stats for a merchant.
 - `get_refunds_by_reason_code()` — Paginated refunds filtered by canonical reason code.
@@ -336,12 +339,23 @@ to request again.
 - `get_next_arbitrators()` — Previews the next arbitrators without advancing the rotation.
 - `reset_rotation_index()` — Admin resets the round-robin rotation index.
 
+### Refund Request Amendments
+
+A merchant can correct a refund request before it is reviewed, instead of cancelling and re-filing it.
+
+- Only the merchant that filed the refund can amend it, and only while it is in `Requested` status and its TTL has not expired. Otherwise it fails with `Unauthorized` (3), `InvalidStatus` (7) or `RefundWindowExpired` (11).
+- The amount can be lowered or kept, never raised (`AmendmentIncreasesAmount`, 64). A lower amount always stays within the policy, payment and cap checks the original request passed, so they are not re-run. To ask for more, file a new request.
+- Lowering the amount gives the difference back to the payment's refund-cap usage.
+- Each refund can be amended at most 3 times (`AmendmentLimitReached`, 65).
+- Changing the reason code invalidates cached `get_reason_code_analytics` windows that cover the refund.
+- Emits `RefundAmended`.
+
 ### Arbitrator Availability
 
 Unavailable arbitrators are skipped by `escalate_to_arbitration`, `auto_assign_arbitrators` and `get_next_arbitrators`, and `assign_arbitrator` rejects them with `ArbitratorUnavailable` (61). They keep their seats and votes on cases they are already assigned to.
 
 - `set_arbitrator_availability()` — Arbitrator opts in or out of new case assignments.
-- `admin_set_arbitrator_availability()` — Admin overrides an arbitrator's availability.
+- `admin_set_arbiter_availability()` — Admin overrides an arbitrator's availability.
 - `is_arbitrator_available()` — Returns whether a registered arbitrator accepts new cases.
 - `get_available_arbitrators()` — Lists registered arbitrators currently accepting cases.
 
@@ -498,6 +512,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | Event             | Topic Name        | Payload Fields                                                             | Fires When                                                           |
 | ----------------- | ----------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------- |
 | `RefundRequested` | `RefundRequested` | `refund_id`, `payment_id`, `merchant`, `customer`, `amount`, `token`       | `request_refund()` creates refund in `Requested` status              |
+| `RefundAmended`   | `RefundAmended`   | `refund_id`, `merchant`, `old_amount`, `new_amount`, `reason_code`, `amendment_count` | `amend_refund_request()` corrects a refund still in `Requested` status |
 | `RefundApproved`  | `RefundApproved`  | `refund_id`, `payment_id`, `amount`, `approved_by`, `approved_at`          | `approve_refund()` moves refund to `Approved` status                 |
 | `RefundRejected`  | `RefundRejected`  | `refund_id`, `rejected_by`, `rejected_at`, `rejection_reason`              | `reject_refund()` moves refund to `PendingAppeal` status             |
 | `RefundProcessed` | `RefundProcessed` | `refund_id`, `processed_by`, `customer`, `amount`, `token`, `processed_at` | `process_refund()` executes approved refund and moves to `Processed` |

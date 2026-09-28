@@ -315,6 +315,11 @@ pub enum ExtError {
     // Merchant response SLA auto-approval
     SlaNotConfigured = 62,
     SlaNotBreached = 63,
+    // Refund request amendments
+    AmendmentIncreasesAmount = 64,
+    AmendmentLimitReached = 65,
+    // Merchant refund date-range query
+    InvalidDateRange = 66,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1231,6 +1236,8 @@ pub enum RefundExtKey {
     ResponseSlaConfig,
     MerchantResponseSla(Address),
     RefundSlaDeadline(u64),
+    // Number of times a refund request has been amended before review.
+    RefundAmendmentCount(u64),
 }
 
 // Issue #195: Batch decision types
@@ -1331,6 +1338,18 @@ pub struct ResponseSlaUpdated {
     pub merchant: Option<Address>,
     pub response_sla_seconds: u64,
     pub active: bool,
+}
+
+/// Event emitted when a merchant amends a refund request that is still awaiting review.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundAmended {
+    pub refund_id: u64,
+    pub merchant: Address,
+    pub old_amount: i128,
+    pub new_amount: i128,
+    pub reason_code: RefundReasonCode,
+    pub amendment_count: u32,
 }
 
 /// Event emitted when an arbitrator toggles availability for new cases.
@@ -4077,6 +4096,73 @@ impl RefundContract {
         offset: u64,
     ) -> Vec<Refund> {
         Self::get_merchant_refunds_by_status_internal(&env, &merchant, status, limit, offset)
+    }
+
+    /// Get a paginated list of a merchant's refunds requested within a time range.
+    ///
+    /// Matches refunds whose `requested_at` falls in `[from, to]` (inclusive,
+    /// ledger timestamps), in request order. `offset` skips that many matches.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address to query.
+    /// * `from` - Start of the range (inclusive).
+    /// * `to` - End of the range (inclusive).
+    /// * `limit` - Maximum number of results to return.
+    /// * `offset` - Number of matching results to skip for pagination.
+    ///
+    /// # Errors
+    /// Returns `InvalidDateRange` if `from` is after `to`.
+    pub fn get_merchant_refunds_in_range(
+        env: Env,
+        merchant: Address,
+        from: u64,
+        to: u64,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<Refund>, Error> {
+        if from > to {
+            return Err(Error::Ext(ExtError::InvalidDateRange));
+        }
+
+        let mut results: Vec<Refund> = Vec::new(&env);
+        if limit == 0 {
+            return Ok(results);
+        }
+
+        let total = Self::get_merchant_refund_count(&env, &merchant);
+        let mut matched = 0u64;
+        let mut collected = 0u64;
+        let mut index = 0u64;
+
+        while index < total && collected < limit {
+            if let Some(refund_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::MerchantRefunds(merchant.clone(), index))
+            {
+                if let Some(refund) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Refund>(&DataKey::Refund(refund_id))
+                {
+                    // The merchant index is append-only in request order, so
+                    // nothing after this point can fall inside the range.
+                    if refund.requested_at > to {
+                        break;
+                    }
+                    if refund.requested_at >= from {
+                        if matched >= offset {
+                            results.push_back(refund);
+                            collected += 1;
+                        }
+                        matched += 1;
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        Ok(results)
     }
 
     /// Get all pending (requested) refunds for a merchant.
@@ -8477,7 +8563,7 @@ impl RefundContract {
     /// # Errors
     /// Returns `Unauthorized` if the caller is not the contract admin.
     /// Returns `NotArbitrator` if the address is not a registered arbitrator.
-    pub fn admin_set_arbitrator_availability(
+    pub fn admin_set_arbiter_availability(
         env: Env,
         admin: Address,
         arbitrator: Address,
@@ -8497,6 +8583,136 @@ impl RefundContract {
     /// Get all registered arbitrators currently accepting new cases.
     pub fn get_available_arbitrators(env: Env) -> Vec<Address> {
         Self::available_arbitrators(&env)
+    }
+
+    // ── Refund request amendments ──────────────────────────────────────────
+
+    /// Maximum number of times a single refund request may be amended.
+    const MAX_REFUND_AMENDMENTS: u32 = 3;
+
+    /// Amend a refund request that has not been reviewed yet.
+    ///
+    /// Only the merchant that filed the request can amend it, and only while it
+    /// is still in `Requested` status (not yet approved, rejected or processed).
+    /// The amount can only be lowered or kept the same: a lower amount always
+    /// stays within the policy, cap and payment checks the original request
+    /// already passed, so none of them need to be re-run. To ask for more, the
+    /// merchant has to file a new request.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant that filed the refund (must authorize).
+    /// * `refund_id` - The refund to amend.
+    /// * `new_amount` - The corrected amount; must be > 0 and <= the current amount.
+    /// * `new_reason` - The corrected human-readable reason.
+    /// * `new_reason_code` - The corrected canonical reason code.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `Unauthorized` if `merchant` did not file the refund.
+    /// Returns `InvalidStatus` if the refund is no longer in `Requested` status.
+    /// Returns `RefundWindowExpired` if the refund's TTL has expired.
+    /// Returns `InvalidAmount` if `new_amount` is not positive.
+    /// Returns `AmendmentIncreasesAmount` if `new_amount` exceeds the current amount.
+    /// Returns `AmendmentLimitReached` if the refund was already amended the maximum number of times.
+    pub fn amend_refund_request(
+        env: Env,
+        merchant: Address,
+        refund_id: u64,
+        new_amount: i128,
+        new_reason: String,
+        new_reason_code: RefundReasonCode,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "amend_refund_request")?;
+        merchant.require_auth();
+
+        let mut refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        if refund.merchant != merchant {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if refund.status != RefundStatus::Requested {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+        if let Some(expires_at) = refund.expires_at {
+            if env.ledger().timestamp() >= expires_at {
+                return Err(Error::Core(CoreError::RefundWindowExpired));
+            }
+        }
+        if new_amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        if new_amount > refund.amount {
+            return Err(Error::Ext(ExtError::AmendmentIncreasesAmount));
+        }
+
+        let amendment_count: u32 = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::RefundAmendmentCount(refund_id))
+            .unwrap_or(0);
+        if amendment_count >= Self::MAX_REFUND_AMENDMENTS {
+            return Err(Error::Ext(ExtError::AmendmentLimitReached));
+        }
+
+        let old_amount = refund.amount;
+        let reason_code_changed = refund.reason_code != new_reason_code;
+
+        // Give the difference back to the payment's refund-cap usage; the
+        // request itself still counts once, so the count is left alone.
+        let released = old_amount - new_amount;
+        if released > 0 {
+            let (count, used): (u32, i128) = env
+                .storage()
+                .instance()
+                .get(&DataKey::PaymentRefundUsage(refund.payment_id))
+                .unwrap_or((0u32, 0i128));
+            env.storage().instance().set(
+                &DataKey::PaymentRefundUsage(refund.payment_id),
+                &(count, used.saturating_sub(released)),
+            );
+        }
+
+        refund.amount = new_amount;
+        refund.reason = new_reason;
+        refund.reason_code = new_reason_code.clone();
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
+
+        let amendment_count = amendment_count + 1;
+        env.storage().instance().set(
+            &RefundExtKey::RefundAmendmentCount(refund_id),
+            &amendment_count,
+        );
+
+        // Cached reason-code analytics windows covering this refund are stale now.
+        if reason_code_changed {
+            Self::invalidate_analytics_cache_for(&env, refund.requested_at);
+        }
+
+        (RefundAmended {
+            refund_id,
+            merchant,
+            old_amount,
+            new_amount,
+            reason_code: new_reason_code,
+            amendment_count,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Number of times a refund request has been amended (0 if never).
+    pub fn get_refund_amendment_count(env: Env, refund_id: u64) -> u32 {
+        env.storage()
+            .instance()
+            .get(&RefundExtKey::RefundAmendmentCount(refund_id))
+            .unwrap_or(0)
     }
 
     // ── Issue #190: Dispute evidence attachment ────────────────────────────
