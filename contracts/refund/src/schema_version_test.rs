@@ -4,7 +4,7 @@ use super::*;
 use soroban_sdk::{testutils::Address as _, Address, Env};
 
 #[test]
-fn test_schema_version_initialized_to_one() {
+fn test_schema_version_initialized_to_current() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register(RefundContract, ());
@@ -12,7 +12,8 @@ fn test_schema_version_initialized_to_one() {
     let admin = Address::generate(&env);
     client.initialize(&admin);
 
-    assert_eq!(client.get_schema_version(), 1);
+    // v2 added RefundStatus::Withdrawn (Issue #695).
+    assert_eq!(client.get_schema_version(), 2);
 }
 
 #[test]
@@ -24,9 +25,9 @@ fn test_migrate_schema_rejects_already_at_target() {
     let admin = Address::generate(&env);
     client.initialize(&admin);
 
-    client.migrate_schema(&admin, &2);
-    assert_eq!(client.get_schema_version(), 2);
+    client.migrate_schema(&admin, &3);
+    assert_eq!(client.get_schema_version(), 3);
 
-    let result = client.try_migrate_schema(&admin, &2);
+    let result = client.try_migrate_schema(&admin, &3);
     assert_eq!(result, Err(Ok(Error::Ext(ExtError::SchemaAlreadyAtTarget))));
 }

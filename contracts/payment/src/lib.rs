@@ -1,8 +1,8 @@
 // This contract uses a multi-level enum structure for DataKey and Error to stay within
 // Soroban's 50-variant XDR limit. Each sub-enum must have <= 50 variants.
 #![no_std]
-// Contract entrypoints mirror their on-chain ABI, so argument counts can't be
-// folded into structs without breaking callers.
+// Contract entry points are the public ABI (and Soroban's generated client
+// mirrors their arity), so their parameter lists can't be collapsed.
 #![allow(clippy::too_many_arguments)]
 use escrow::EscrowContractClient;
 use soroban_sdk::{

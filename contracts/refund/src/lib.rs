@@ -1,6 +1,6 @@
 #![no_std]
-// Contract entrypoints mirror their on-chain ABI, so argument counts can't be
-// folded into structs without breaking callers.
+// Contract entry points are the public ABI (and Soroban's generated client
+// mirrors their arity), so their parameter lists can't be collapsed.
 #![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
@@ -198,6 +198,11 @@ pub enum VoucherKey {
     CustomerVoucher(Address, u64),
     CustomerVoucherCount(Address),
     RefundVoucherIssued(u64),
+    // Issue #698: present (true) for vouchers issued while their merchant had
+    // voucher transfers disabled; snapshotted at issuance.
+    NonTransferable(u64),
+    // Issue #698: present (true) while a merchant issues non-transferable vouchers.
+    MerchantTransferDisabled(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -216,6 +221,8 @@ pub enum RefundStatus {
     Rejected,
     Processed,
     PendingAppeal,
+    // Issue #695: the customer withdrew the request before it was decided.
+    Withdrawn,
 }
 
 // Issue #397: canonical reason codes, enforced by the type system on Refund and
@@ -318,6 +325,11 @@ pub enum ExtError {
     // Merchant response SLA auto-approval
     SlaNotConfigured = 62,
     SlaNotBreached = 63,
+    // Refund request amendments
+    AmendmentIncreasesAmount = 64,
+    AmendmentLimitReached = 65,
+    // Merchant refund date-range query
+    InvalidDateRange = 66,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -625,6 +637,63 @@ pub struct RefundVoucher {
     pub redeemed: bool,
 }
 
+// Issue #696: merchant counter-offer for a partial refund
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct CounterOffer {
+    pub refund_id: u64,
+    pub merchant: Address,
+    pub amount: i128,
+    pub offered_at: u64,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CounterOfferMade {
+    pub refund_id: u64,
+    pub merchant: Address,
+    pub requested_amount: i128,
+    pub offered_amount: i128,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CounterOfferAccepted {
+    pub refund_id: u64,
+    pub customer: Address,
+    pub requested_amount: i128,
+    pub accepted_amount: i128,
+}
+
+// Issue #695: customer withdrawal of a pending refund request
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundWithdrawn {
+    pub refund_id: u64,
+    pub payment_id: u64,
+    pub customer: Address,
+    pub amount: i128,
+    pub withdrawn_at: u64,
+}
+
+// Issue #698: transferable refund vouchers
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherTransferred {
+    pub voucher_id: u64,
+    pub from: Address,
+    pub to: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherTransferabilitySet {
+    pub merchant: Address,
+    pub transferable: bool,
+}
+
 // Issue #194: Tiered arbitration escalation
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -894,7 +963,7 @@ enum ExternalPaymentStatus {
     Cancelled,
 }
 
-// Variant names are serialized as on-chain symbols, so they keep their casing.
+// Variant names mirror the payment contract's `Currency` enum on the wire.
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone)]
 #[contracttype]
@@ -1236,6 +1305,8 @@ pub enum RefundExtKey {
     ResponseSlaConfig,
     MerchantResponseSla(Address),
     RefundSlaDeadline(u64),
+    // Number of times a refund request has been amended before review.
+    RefundAmendmentCount(u64),
 }
 
 // Issue #195: Batch decision types
@@ -1338,6 +1409,18 @@ pub struct ResponseSlaUpdated {
     pub active: bool,
 }
 
+/// Event emitted when a merchant amends a refund request that is still awaiting review.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundAmended {
+    pub refund_id: u64,
+    pub merchant: Address,
+    pub old_amount: i128,
+    pub new_amount: i128,
+    pub reason_code: RefundReasonCode,
+    pub amendment_count: u32,
+}
+
 /// Event emitted when an arbitrator toggles availability for new cases.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1409,7 +1492,12 @@ pub struct RefundContract;
 #[contractimpl]
 impl RefundContract {
     const BATCH_DECISION_LIMIT: u32 = 50;
+    // Schema version assumed for deployments that predate schema tracking.
     const INITIAL_SCHEMA_VERSION: u32 = 1;
+    // v2 (Issue #695): adds `RefundStatus::Withdrawn`.
+    const CURRENT_SCHEMA_VERSION: u32 = 2;
+    // Issue #696: how long a merchant counter-offer stays open (7 days).
+    const COUNTER_OFFER_TTL_SECONDS: u64 = 604800;
 
     /// Initialize the refund contract with an admin address.
     ///
@@ -1425,7 +1513,7 @@ impl RefundContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
-            .set(&SystemKey::SchemaVersion, &Self::INITIAL_SCHEMA_VERSION);
+            .set(&SystemKey::SchemaVersion, &Self::CURRENT_SCHEMA_VERSION);
 
         // Set default refund policy (30 days, 100% refund)
         let mut default_tiers = Vec::new(&env);
@@ -1789,6 +1877,7 @@ impl RefundContract {
         }
 
         Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
+        Self::clear_counter_offer(env, refund_id);
 
         let appeal_window: u64 = env
             .storage()
@@ -4084,6 +4173,73 @@ impl RefundContract {
         Self::get_merchant_refunds_by_status_internal(&env, &merchant, status, limit, offset)
     }
 
+    /// Get a paginated list of a merchant's refunds requested within a time range.
+    ///
+    /// Matches refunds whose `requested_at` falls in `[from, to]` (inclusive,
+    /// ledger timestamps), in request order. `offset` skips that many matches.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address to query.
+    /// * `from` - Start of the range (inclusive).
+    /// * `to` - End of the range (inclusive).
+    /// * `limit` - Maximum number of results to return.
+    /// * `offset` - Number of matching results to skip for pagination.
+    ///
+    /// # Errors
+    /// Returns `InvalidDateRange` if `from` is after `to`.
+    pub fn get_merchant_refunds_in_range(
+        env: Env,
+        merchant: Address,
+        from: u64,
+        to: u64,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<Refund>, Error> {
+        if from > to {
+            return Err(Error::Ext(ExtError::InvalidDateRange));
+        }
+
+        let mut results: Vec<Refund> = Vec::new(&env);
+        if limit == 0 {
+            return Ok(results);
+        }
+
+        let total = Self::get_merchant_refund_count(&env, &merchant);
+        let mut matched = 0u64;
+        let mut collected = 0u64;
+        let mut index = 0u64;
+
+        while index < total && collected < limit {
+            if let Some(refund_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::MerchantRefunds(merchant.clone(), index))
+            {
+                if let Some(refund) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Refund>(&DataKey::Refund(refund_id))
+                {
+                    // The merchant index is append-only in request order, so
+                    // nothing after this point can fall inside the range.
+                    if refund.requested_at > to {
+                        break;
+                    }
+                    if refund.requested_at >= from {
+                        if matched >= offset {
+                            results.push_back(refund);
+                            collected += 1;
+                        }
+                        matched += 1;
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        Ok(results)
+    }
+
     /// Get all pending (requested) refunds for a merchant.
     ///
     /// # Arguments
@@ -4150,6 +4306,7 @@ impl RefundContract {
                             pending_count += 1;
                             pending_amount += refund.amount;
                         }
+                        RefundStatus::Withdrawn => {}
                     }
                 }
             }
@@ -4282,7 +4439,9 @@ impl RefundContract {
             (RefundReasonCode::Other, other),
         ];
 
-        ordered.sort_by(|a, b| {
+        // Ties are broken by a unique rank, so the order is total and an
+        // unstable sort (available in no_std, unlike `sort_by`) is deterministic.
+        ordered.sort_unstable_by(|a, b| {
             let count_cmp = b.1.cmp(&a.1);
             if count_cmp == core::cmp::Ordering::Equal {
                 Self::reason_code_rank(&a.0).cmp(&Self::reason_code_rank(&b.0))
@@ -5814,6 +5973,7 @@ impl RefundContract {
         }
 
         Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
+        Self::clear_counter_offer(env, refund_id);
         refund.status = RefundStatus::Approved;
         // Issue #147: Set approved_at timestamp
         refund.approved_at = Some(env.ledger().timestamp());
@@ -6443,7 +6603,7 @@ impl RefundContract {
     /// A `CircuitBreakerState` indicating whether the breaker is tripped, the trip count,
     /// the last observed refund rate, and the auto-reset timestamp.
     pub fn get_circuit_breaker_state(env: Env) -> CircuitBreakerState {
-        // Only mutated by the `cfg(test)` override below.
+        // Only mutated by the #[cfg(test)] override below.
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut state = env
             .storage()
@@ -8188,6 +8348,7 @@ impl RefundContract {
         }
 
         Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
+        Self::clear_counter_offer(&env, refund_id);
         refund.status = RefundStatus::Rejected;
         refund.rejected_at = Some(env.ledger().timestamp());
         env.storage()
@@ -8482,7 +8643,7 @@ impl RefundContract {
     /// # Errors
     /// Returns `Unauthorized` if the caller is not the contract admin.
     /// Returns `NotArbitrator` if the address is not a registered arbitrator.
-    pub fn override_arbitrator_availability(
+    pub fn admin_set_arbiter_availability(
         env: Env,
         admin: Address,
         arbitrator: Address,
@@ -8502,6 +8663,136 @@ impl RefundContract {
     /// Get all registered arbitrators currently accepting new cases.
     pub fn get_available_arbitrators(env: Env) -> Vec<Address> {
         Self::available_arbitrators(&env)
+    }
+
+    // ── Refund request amendments ──────────────────────────────────────────
+
+    /// Maximum number of times a single refund request may be amended.
+    const MAX_REFUND_AMENDMENTS: u32 = 3;
+
+    /// Amend a refund request that has not been reviewed yet.
+    ///
+    /// Only the merchant that filed the request can amend it, and only while it
+    /// is still in `Requested` status (not yet approved, rejected or processed).
+    /// The amount can only be lowered or kept the same: a lower amount always
+    /// stays within the policy, cap and payment checks the original request
+    /// already passed, so none of them need to be re-run. To ask for more, the
+    /// merchant has to file a new request.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant that filed the refund (must authorize).
+    /// * `refund_id` - The refund to amend.
+    /// * `new_amount` - The corrected amount; must be > 0 and <= the current amount.
+    /// * `new_reason` - The corrected human-readable reason.
+    /// * `new_reason_code` - The corrected canonical reason code.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `Unauthorized` if `merchant` did not file the refund.
+    /// Returns `InvalidStatus` if the refund is no longer in `Requested` status.
+    /// Returns `RefundWindowExpired` if the refund's TTL has expired.
+    /// Returns `InvalidAmount` if `new_amount` is not positive.
+    /// Returns `AmendmentIncreasesAmount` if `new_amount` exceeds the current amount.
+    /// Returns `AmendmentLimitReached` if the refund was already amended the maximum number of times.
+    pub fn amend_refund_request(
+        env: Env,
+        merchant: Address,
+        refund_id: u64,
+        new_amount: i128,
+        new_reason: String,
+        new_reason_code: RefundReasonCode,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "amend_refund_request")?;
+        merchant.require_auth();
+
+        let mut refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        if refund.merchant != merchant {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if refund.status != RefundStatus::Requested {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+        if let Some(expires_at) = refund.expires_at {
+            if env.ledger().timestamp() >= expires_at {
+                return Err(Error::Core(CoreError::RefundWindowExpired));
+            }
+        }
+        if new_amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        if new_amount > refund.amount {
+            return Err(Error::Ext(ExtError::AmendmentIncreasesAmount));
+        }
+
+        let amendment_count: u32 = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::RefundAmendmentCount(refund_id))
+            .unwrap_or(0);
+        if amendment_count >= Self::MAX_REFUND_AMENDMENTS {
+            return Err(Error::Ext(ExtError::AmendmentLimitReached));
+        }
+
+        let old_amount = refund.amount;
+        let reason_code_changed = refund.reason_code != new_reason_code;
+
+        // Give the difference back to the payment's refund-cap usage; the
+        // request itself still counts once, so the count is left alone.
+        let released = old_amount - new_amount;
+        if released > 0 {
+            let (count, used): (u32, i128) = env
+                .storage()
+                .instance()
+                .get(&DataKey::PaymentRefundUsage(refund.payment_id))
+                .unwrap_or((0u32, 0i128));
+            env.storage().instance().set(
+                &DataKey::PaymentRefundUsage(refund.payment_id),
+                &(count, used.saturating_sub(released)),
+            );
+        }
+
+        refund.amount = new_amount;
+        refund.reason = new_reason;
+        refund.reason_code = new_reason_code.clone();
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
+
+        let amendment_count = amendment_count + 1;
+        env.storage().instance().set(
+            &RefundExtKey::RefundAmendmentCount(refund_id),
+            &amendment_count,
+        );
+
+        // Cached reason-code analytics windows covering this refund are stale now.
+        if reason_code_changed {
+            Self::invalidate_analytics_cache_for(&env, refund.requested_at);
+        }
+
+        (RefundAmended {
+            refund_id,
+            merchant,
+            old_amount,
+            new_amount,
+            reason_code: new_reason_code,
+            amendment_count,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Number of times a refund request has been amended (0 if never).
+    pub fn get_refund_amendment_count(env: Env, refund_id: u64) -> u32 {
+        env.storage()
+            .instance()
+            .get(&RefundExtKey::RefundAmendmentCount(refund_id))
+            .unwrap_or(0)
     }
 
     // ── Issue #190: Dispute evidence attachment ────────────────────────────
@@ -8745,6 +9036,197 @@ impl RefundContract {
         results
     }
 
+    // ── Issue #695: Customer withdrawal of pending refund requests ─────────
+
+    /// Withdraw a refund request that is still awaiting a decision.
+    ///
+    /// Moves the refund from `Requested` to `Withdrawn`, releases the
+    /// per-payment refund-cap usage the request consumed, and drops any pending
+    /// counter-offer and response-SLA deadline. Emits `RefundWithdrawn`.
+    ///
+    /// # Arguments
+    /// * `customer` - The refund's customer (must be authorized).
+    /// * `refund_id` - The ID of the refund to withdraw.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `Unauthorized` if the caller is not the refund's customer.
+    /// Returns `InvalidStatus` if the refund is no longer `Requested`.
+    pub fn withdraw_refund_request(
+        env: Env,
+        customer: Address,
+        refund_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "withdraw_refund_request")?;
+        customer.require_auth();
+
+        let mut refund = Self::get_refund(&env, refund_id)?;
+        if refund.customer != customer {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if refund.status != RefundStatus::Requested {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+
+        Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
+        refund.status = RefundStatus::Withdrawn;
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
+        Self::add_to_status_index(&env, RefundStatus::Withdrawn, refund_id);
+
+        Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
+        Self::clear_counter_offer(&env, refund_id);
+        env.storage()
+            .instance()
+            .remove(&RefundExtKey::RefundSlaDeadline(refund_id));
+
+        RefundWithdrawn {
+            refund_id,
+            payment_id: refund.payment_id,
+            customer,
+            amount: refund.amount,
+            withdrawn_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    // ── Issue #696: Merchant counter-offers for partial refunds ─────────────
+
+    /// Offer the customer a smaller refund than they requested.
+    ///
+    /// The offer stays open for 7 days. The refund stays `Requested` with its
+    /// original amount until the customer accepts; if the offer expires, the
+    /// original request remains. A new offer replaces any earlier one.
+    /// Emits `CounterOfferMade`.
+    ///
+    /// # Arguments
+    /// * `merchant` - The refund's merchant (must be authorized).
+    /// * `refund_id` - The ID of the refund to counter.
+    /// * `amount` - The offered amount; must be > 0 and < the requested amount.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `Unauthorized` if the caller is not the refund's merchant.
+    /// Returns `InvalidStatus` if the refund is no longer `Requested`.
+    /// Returns `InvalidCounterOffer` if `amount` is not in `(0, requested)`.
+    pub fn counter_offer(
+        env: Env,
+        merchant: Address,
+        refund_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "counter_offer")?;
+        merchant.require_auth();
+
+        let refund = Self::get_refund(&env, refund_id)?;
+        if refund.merchant != merchant {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if refund.status != RefundStatus::Requested {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+        if amount <= 0 || amount >= refund.amount {
+            return Err(Error::Ext(ExtError::InvalidCounterOffer));
+        }
+
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(Self::COUNTER_OFFER_TTL_SECONDS);
+        env.storage().instance().set(
+            &RefundExtKey::CounterOffer(refund_id),
+            &CounterOffer {
+                refund_id,
+                merchant: merchant.clone(),
+                amount,
+                offered_at: now,
+                expires_at,
+            },
+        );
+
+        CounterOfferMade {
+            refund_id,
+            merchant,
+            requested_amount: refund.amount,
+            offered_amount: amount,
+            expires_at,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Accept the merchant's counter-offer.
+    ///
+    /// Sets the refund amount to the offered amount and approves the refund, so
+    /// the accepted amount is what `process_refund` pays out. The per-payment
+    /// refund-cap usage shrinks to match. Emits `CounterOfferAccepted` and
+    /// `RefundApproved`.
+    ///
+    /// # Arguments
+    /// * `customer` - The refund's customer (must be authorized).
+    /// * `refund_id` - The ID of the refund whose offer is accepted.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `Unauthorized` if the caller is not the refund's customer.
+    /// Returns `InvalidStatus` if the refund is no longer `Requested`.
+    /// Returns `CounterOfferNotFound` if no offer is pending.
+    /// Returns `CounterOfferExpired` if the offer's window has passed.
+    /// Returns `RefundWindowExpired` if the refund's TTL has expired.
+    pub fn accept_counter_offer(env: Env, customer: Address, refund_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "accept_counter_offer")?;
+        customer.require_auth();
+
+        let mut refund = Self::get_refund(&env, refund_id)?;
+        if refund.customer != customer {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if refund.status != RefundStatus::Requested {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+        let offer: CounterOffer = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::CounterOffer(refund_id))
+            .ok_or(Error::Ext(ExtError::CounterOfferNotFound))?;
+        if env.ledger().timestamp() > offer.expires_at {
+            return Err(Error::Ext(ExtError::CounterOfferExpired));
+        }
+
+        let requested_amount = refund.amount;
+        let (count, used) = Self::get_payment_refund_usage(env.clone(), refund.payment_id);
+        env.storage().instance().set(
+            &DataKey::PaymentRefundUsage(refund.payment_id),
+            &(count, used.saturating_sub(requested_amount - offer.amount)),
+        );
+
+        refund.amount = offer.amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
+        // Also clears the offer.
+        Self::approve_refund_internal(&env, offer.merchant, refund_id)?;
+
+        CounterOfferAccepted {
+            refund_id,
+            customer,
+            requested_amount,
+            accepted_amount: offer.amount,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Get the merchant's pending counter-offer for a refund, if any.
+    pub fn get_counter_offer(env: Env, refund_id: u64) -> Option<CounterOffer> {
+        env.storage()
+            .instance()
+            .get(&RefundExtKey::CounterOffer(refund_id))
+    }
+
     // ── Issue #192: Refund credit vouchers ────────────────────────────────
 
     /// Issue a refund credit voucher for an approved refund.
@@ -8832,19 +9314,14 @@ impl RefundContract {
             .instance()
             .set(&VoucherKey::RefundVoucherIssued(refund_id), &true);
 
-        let customer_count: u64 = env
-            .storage()
-            .instance()
-            .get(&VoucherKey::CustomerVoucherCount(refund.customer.clone()))
-            .unwrap_or(0);
-        env.storage().instance().set(
-            &VoucherKey::CustomerVoucher(refund.customer.clone(), customer_count),
-            &voucher_id,
-        );
-        env.storage().instance().set(
-            &VoucherKey::CustomerVoucherCount(refund.customer.clone()),
-            &(customer_count + 1),
-        );
+        // Issue #698: snapshot the merchant's transfer setting onto the voucher.
+        if !Self::get_vouchers_transferable(env.clone(), refund.merchant.clone()) {
+            env.storage()
+                .instance()
+                .set(&VoucherKey::NonTransferable(voucher_id), &true);
+        }
+
+        Self::add_customer_voucher(&env, &refund.customer, voucher_id);
 
         Ok(voucher_id)
     }
@@ -8858,7 +9335,7 @@ impl RefundContract {
     ///
     /// # Errors
     /// Returns `VoucherNotFound` if the voucher does not exist.
-    /// Returns `Unauthorized` if the caller is not the voucher's customer.
+    /// Returns `Unauthorized` if the caller is not the voucher's current owner.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has already been used.
     /// Returns `VoucherExpired` if the voucher has expired.
     pub fn redeem_refund_voucher(
@@ -8944,6 +9421,120 @@ impl RefundContract {
             i += 1;
         }
         results
+    }
+
+    // ── Issue #698: Transferable refund vouchers ─────────────────────────
+
+    /// Transfer an unredeemed, unexpired voucher to another address.
+    ///
+    /// Only the new owner can redeem the voucher afterwards. Both owners'
+    /// voucher indexes are updated. Emits `VoucherTransferred`.
+    ///
+    /// # Arguments
+    /// * `owner` - The voucher's current owner (must be authorized).
+    /// * `voucher_id` - The ID of the voucher to transfer.
+    /// * `new_owner` - The address receiving the voucher.
+    ///
+    /// # Errors
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    /// Returns `Unauthorized` if the caller does not own the voucher.
+    /// Returns `VoucherAlreadyRedeemed` if the voucher has been redeemed.
+    /// Returns `VoucherExpired` if the voucher has expired.
+    /// Returns `VoucherNotTransferable` if the voucher was issued non-transferable.
+    /// Returns `InvalidVoucherRecipient` if `new_owner` is the current owner.
+    pub fn transfer_voucher(
+        env: Env,
+        owner: Address,
+        voucher_id: u64,
+        new_owner: Address,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "transfer_voucher")?;
+        owner.require_auth();
+
+        let mut voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+
+        if voucher.customer != owner {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if voucher.redeemed {
+            return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+        if env.ledger().timestamp() > voucher.expires_at {
+            return Err(Error::Ext(ExtError::VoucherExpired));
+        }
+        if !Self::is_voucher_transferable(env.clone(), voucher_id) {
+            return Err(Error::Ext(ExtError::VoucherNotTransferable));
+        }
+        if new_owner == owner {
+            return Err(Error::Ext(ExtError::InvalidVoucherRecipient));
+        }
+
+        Self::remove_customer_voucher(&env, &owner, voucher_id);
+        Self::add_customer_voucher(&env, &new_owner, voucher_id);
+        voucher.customer = new_owner.clone();
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Voucher(voucher_id), &voucher);
+
+        VoucherTransferred {
+            voucher_id,
+            from: owner,
+            to: new_owner,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Set whether vouchers issued for this merchant's refunds can be transferred.
+    ///
+    /// The setting is snapshotted onto each voucher when it is issued, so
+    /// changing it does not affect vouchers that already exist. Vouchers are
+    /// transferable by default. Emits `VoucherTransferabilitySet`.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant (must be authorized).
+    /// * `transferable` - `false` to issue non-transferable vouchers.
+    pub fn set_vouchers_transferable(
+        env: Env,
+        merchant: Address,
+        transferable: bool,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_vouchers_transferable")?;
+        merchant.require_auth();
+
+        let key = VoucherKey::MerchantTransferDisabled(merchant.clone());
+        if transferable {
+            env.storage().instance().remove(&key);
+        } else {
+            env.storage().instance().set(&key, &true);
+        }
+
+        VoucherTransferabilitySet {
+            merchant,
+            transferable,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Whether new vouchers for this merchant's refunds are issued transferable.
+    pub fn get_vouchers_transferable(env: Env, merchant: Address) -> bool {
+        !env.storage()
+            .instance()
+            .has(&VoucherKey::MerchantTransferDisabled(merchant))
+    }
+
+    /// Whether a voucher can be transferred (ignores redemption and expiry).
+    pub fn is_voucher_transferable(env: Env, voucher_id: u64) -> bool {
+        !env.storage()
+            .instance()
+            .has(&VoucherKey::NonTransferable(voucher_id))
     }
 
     // ── Issue #194: Tiered arbitration escalation ─────────────────────────
@@ -9238,6 +9829,55 @@ impl RefundContract {
         );
     }
 
+    fn clear_counter_offer(env: &Env, refund_id: u64) {
+        env.storage()
+            .instance()
+            .remove(&RefundExtKey::CounterOffer(refund_id));
+    }
+
+    fn add_customer_voucher(env: &Env, customer: &Address, voucher_id: u64) {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::CustomerVoucherCount(customer.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &VoucherKey::CustomerVoucher(customer.clone(), count),
+            &voucher_id,
+        );
+        env.storage().instance().set(
+            &VoucherKey::CustomerVoucherCount(customer.clone()),
+            &(count + 1),
+        );
+    }
+
+    /// Swap-removes `voucher_id` from the customer's voucher index.
+    fn remove_customer_voucher(env: &Env, customer: &Address, voucher_id: u64) {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::CustomerVoucherCount(customer.clone()))
+            .unwrap_or(0);
+        let mut i = 0u64;
+        while i < count {
+            let key = VoucherKey::CustomerVoucher(customer.clone(), i);
+            if env.storage().instance().get::<_, u64>(&key) == Some(voucher_id) {
+                let last_key = VoucherKey::CustomerVoucher(customer.clone(), count - 1);
+                if i != count - 1 {
+                    let last: u64 = env.storage().instance().get(&last_key).unwrap();
+                    env.storage().instance().set(&key, &last);
+                }
+                env.storage().instance().remove(&last_key);
+                env.storage().instance().set(
+                    &VoucherKey::CustomerVoucherCount(customer.clone()),
+                    &(count - 1),
+                );
+                return;
+            }
+            i += 1;
+        }
+    }
+
     fn clear_arbitration_votes(env: &Env, case_id: u64) {
         let voters: Vec<Address> = env
             .storage()
@@ -9460,7 +10100,10 @@ mod test_merchant_override_and_error_codes;
 mod test_admin_rotation;
 
 #[cfg(test)]
-mod test_arbitrator_assignment;
+mod test_refund_withdrawal;
 
 #[cfg(test)]
-mod test_category_windows;
+mod test_counter_offer;
+
+#[cfg(test)]
+mod test_voucher_transfer;

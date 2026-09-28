@@ -1,8 +1,8 @@
 // This contract uses a multi-level enum structure for DataKey and Error to stay within
 // Soroban's 50-variant XDR limit. Each sub-enum must have <= 50 variants.
 #![no_std]
-// Contract entrypoints mirror their on-chain ABI, so argument counts can't be
-// folded into structs without breaking callers.
+// Contract entry points are the public ABI (and Soroban's generated client
+// mirrors their arity), so their parameter lists can't be collapsed.
 #![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
@@ -73,6 +73,10 @@ pub enum EscrowKey {
     SubAccountCounter(u64),
     EscrowHierarchy(u64),
     ReleaseMultisig(u64),
+    // Issue #694: off-chain order reference, unique per merchant.
+    // (merchant, reference) -> escrow_id, and escrow_id -> reference.
+    Reference(Address, BytesN<32>),
+    EscrowReference(u64),
 }
 
 #[derive(Clone)]
@@ -182,6 +186,7 @@ pub enum EscrowError {
     InvalidThreshold = 227,
     SuccessionPlanExists = 228,
     ClawbackDelayTooShort = 229,
+    DuplicateReference = 230,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -255,7 +260,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ActionError>(code)
                 }));
             }
-            if (200..=229).contains(&code) {
+            if (200..=230).contains(&code) {
                 return Ok(Error::Escrow(unsafe {
                     core::mem::transmute::<u32, EscrowError>(code)
                 }));
@@ -284,6 +289,10 @@ impl TryFromVal<Env, Val> for Error {
         Error::try_from(error).map_err(|_| soroban_sdk::ConversionError)
     }
 }
+
+// Secondary storage keys (keeps `DataKey` within Soroban's 50-variant limit).
+
+// Observer storage keys (separate enum to stay within Soroban symbol limits).
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -565,6 +574,14 @@ pub struct EscrowCreated {
     pub amount: i128,
     pub token: Address,
     pub release_timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowReferenceSet {
+    pub escrow_id: u64,
+    pub merchant: Address,
+    pub reference: BytesN<32>,
 }
 
 #[contractevent]
@@ -2768,7 +2785,85 @@ impl EscrowContract {
             expiry_timestamp,
             auto_refund_on_expiry,
             None,
+            None,
         )
+    }
+
+    /// Creates an escrow linked to an off-chain order reference (Issue #694).
+    ///
+    /// Behaves exactly like [`Self::create_escrow`], and additionally records
+    /// `reference` so the escrow can later be found with
+    /// [`Self::get_escrow_by_reference`]. A reference is unique per merchant and
+    /// stays bound to its escrow for the escrow's whole lifetime.
+    ///
+    /// # Arguments
+    /// * `reference` - 32-byte order reference (e.g. a hash of the order ID).
+    /// * All other arguments are the same as [`Self::create_escrow`].
+    ///
+    /// # Returns
+    /// Results in `Ok(u64)` (the new escrow ID) on success.
+    ///
+    /// # Errors
+    /// Returns `EscrowError::DuplicateReference` if `merchant` already has an
+    /// escrow with this reference, plus every error `create_escrow` can return.
+    pub fn create_escrow_with_reference(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        release_timestamp: u64,
+        min_hold_period: u64,
+        expiry_timestamp: u64,
+        auto_refund_on_expiry: bool,
+        reference: BytesN<32>,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+        Self::require_not_paused(&env, "create_escrow")?;
+        Self::internal_create_escrow(
+            env,
+            customer,
+            merchant,
+            amount,
+            token,
+            release_timestamp,
+            min_hold_period,
+            expiry_timestamp,
+            auto_refund_on_expiry,
+            None,
+            Some(reference),
+        )
+    }
+
+    /// Looks up an escrow by the order reference it was created with.
+    ///
+    /// # Arguments
+    /// * `merchant` - Merchant the reference belongs to.
+    /// * `reference` - Reference passed to `create_escrow_with_reference`.
+    ///
+    /// # Errors
+    /// Returns `EscrowError::NotFound` if `merchant` has no escrow with this reference.
+    pub fn get_escrow_by_reference(
+        env: Env,
+        merchant: Address,
+        reference: BytesN<32>,
+    ) -> Result<Escrow, Error> {
+        let escrow_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Reference(merchant, reference)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        env.storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))
+    }
+
+    /// Returns the order reference an escrow was created with, if any.
+    pub fn get_escrow_reference(env: Env, escrow_id: u64) -> Option<BytesN<32>> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::EscrowReference(escrow_id)))
     }
 
     /// Creates escrow with multisig.
@@ -2815,6 +2910,7 @@ impl EscrowContract {
             expiry_timestamp,
             auto_refund_on_expiry,
             Some(multisig),
+            None,
         )
     }
 
@@ -2829,6 +2925,7 @@ impl EscrowContract {
         expiry_timestamp: u64,
         auto_refund_on_expiry: bool,
         multisig: Option<MultisigConfiguration>,
+        reference: Option<BytesN<32>>,
     ) -> Result<u64, Error> {
         // Block new escrow creation during migration
         if let Some(status) = env
@@ -2858,6 +2955,19 @@ impl EscrowContract {
         if let Some(config) = &multisig {
             if !config.signers.is_empty() {
                 Self::validate_release_multisig_threshold(config.threshold, &config.signers)?;
+            }
+        }
+
+        if let Some(reference) = &reference {
+            if env
+                .storage()
+                .instance()
+                .has(&DataKey::Escrow(EscrowKey::Reference(
+                    merchant.clone(),
+                    reference.clone(),
+                )))
+            {
+                return Err(Error::Escrow(EscrowError::DuplicateReference));
             }
         }
 
@@ -2985,6 +3095,23 @@ impl EscrowContract {
 
         // Issue #398: emitting this event is what lets dashboards subscribe to
         // new-escrow notifications via Horizon instead of polling known escrow IDs.
+        if let Some(reference) = reference {
+            env.storage().instance().set(
+                &DataKey::Escrow(EscrowKey::Reference(merchant.clone(), reference.clone())),
+                &escrow_id,
+            );
+            env.storage().instance().set(
+                &DataKey::Escrow(EscrowKey::EscrowReference(escrow_id)),
+                &reference,
+            );
+            EscrowReferenceSet {
+                escrow_id,
+                merchant: merchant.clone(),
+                reference,
+            }
+            .publish(&env);
+        }
+
         EscrowCreated {
             escrow_id,
             customer,
@@ -10056,15 +10183,13 @@ impl EscrowContract {
         let merchant_votes = dispute.votes_for_merchant.len();
         let customer_votes = dispute.votes_for_customer.len();
 
-        let favor_merchant;
-
-        if merchant_votes >= dispute.quorum_required {
-            favor_merchant = true;
+        let favor_merchant = if merchant_votes >= dispute.quorum_required {
+            true
         } else if customer_votes >= dispute.quorum_required || now > dispute.resolution_deadline {
-            favor_merchant = false;
+            false
         } else {
             return Err(Error::Action(ActionError::ApprovalsThresholdNotMet));
-        }
+        };
 
         dispute.resolved = true;
         env.storage().instance().set(
@@ -10244,7 +10369,7 @@ impl EscrowContract {
             .unwrap_or(0);
         let escrow_id = counter + 1;
 
-        let fee_config = Self::effective_fee_config(env, &entry.token);
+        let fee_config = Self::get_escrow_fee_config(env.clone());
         let _fee_bps = if fee_config.enabled {
             fee_config.fee_bps
         } else {
@@ -11558,6 +11683,7 @@ impl EscrowContract {
             parent_escrow.expiry_timestamp,
             parent_escrow.auto_refund_on_expiry,
             None,
+            None,
         )?;
 
         // Update parent children list
@@ -11916,6 +12042,9 @@ mod appeal_expiry_test;
 
 #[cfg(test)]
 mod escalation_timeout_test;
+
+#[cfg(test)]
+mod reference_test;
 //
 // mod health_check_test;
 //

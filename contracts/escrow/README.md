@@ -5,6 +5,9 @@ This contract manages secure, conditional fund holding for the Facil-Pay ecosyst
 ## Public Functions
 
 - create_escrow: Initializes a new escrow agreement with locked funds, terms, and designated participants.
+- create_escrow_with_reference: Same as create_escrow, but links the escrow to an off-chain order reference that is unique per merchant. See [Order References](#order-references).
+- get_escrow_by_reference: Looks up an escrow by merchant and order reference.
+- get_escrow_reference: Returns the order reference an escrow was created with, if any.
 - release_escrow: Releases the held funds to the recipient once the agreed-upon conditions are successfully met.
 - dispute_escrow: Flags the escrow transaction for administrative arbitration if participants cannot reach a consensus.
 - withdraw_dispute: Lets the party that opened a dispute withdraw it before resolution, returning the escrow to `Locked` and refunding any dispute collateral.
@@ -29,90 +32,34 @@ These are distinct timers rather than one combined timeout. Escalation timeout i
 
 ---
 
-## Withdrawing a Dispute
+## Order References
 
-If the parties settle privately after a dispute is opened, the party that opened it can withdraw it instead of waiting for admin resolution.
+An escrow can be linked to an off-chain order in a verifiable way by creating it with a 32-byte reference, typically a hash of the merchant's order ID. Each reference is unique per merchant and stays bound to its escrow for the escrow's whole lifetime, including after it is released, refunded or cancelled. Two different merchants may use the same reference.
 
-```
-withdraw_dispute(caller, escrow_id) -> ()
-```
+### Functions
 
-| Parameter   | Type      | Description                                                     |
-| ----------- | --------- | --------------------------------------------------------------- |
-| `caller`    | `Address` | The party that called `dispute_escrow`. Must authorize the call. |
-| `escrow_id` | `u64`     | The disputed escrow.                                            |
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `create_escrow_with_reference` | `customer`, `merchant`, `amount`, `token`, `release_timestamp`, `min_hold_period`, `expiry_timestamp`, `auto_refund_on_expiry` (all as in `create_escrow`), `reference: BytesN<32>` | `Result<u64, Error>`: the new escrow ID |
+| `get_escrow_by_reference` | `merchant: Address`, `reference: BytesN<32>` | `Result<Escrow, Error>`: the matching escrow |
+| `get_escrow_reference` | `escrow_id: u64` | `Option<BytesN<32>>`: `None` for escrows created without a reference |
 
-On success:
-
-- The escrow status returns from `Disputed` to `Locked`. It can then be released, refunded, or disputed again as normal.
-- `evidence_deadline` and `escalated_at` are cleared, `escalation_level` is reset to `0`, and any pending escalation deadline is removed from the escalation queue, so the dispute cannot be auto-resolved later.
-- If collateral was deposited under `DisputeConfig`, the full amount is transferred back to the disputing party and the collateral record is removed.
-- Dispute analytics (`total_disputes`) are not rolled back, and evidence already submitted stays on record.
-
-Only the opener can withdraw. The counterparty, admins, and observers cannot. If the escrow is disputed again after a withdrawal, the new opener owns that dispute. Disputes opened before this function existed are attributed to the `disputing_party` on their collateral record, if one exists.
+`create_escrow_with_reference` requires the customer's authorization and is blocked while `create_escrow` is paused. The duplicate check runs before any funds move, so a rejected call transfers nothing. `create_escrow` is unchanged and creates escrows without a reference.
 
 ### Errors
 
-| Error                       | Cause                                                                                           |
-| --------------------------- | ----------------------------------------------------------------------------------------------- |
-| `EscrowError::NotFound`     | The escrow does not exist                                                                       |
-| `ActionError::NotDisputed`  | The escrow is not currently `Disputed`, including disputes already resolved (`Released`/`Resolved`) |
-| `BasicError::Unauthorized`  | `caller` did not open the dispute                                                               |
-| `BasicError::ContractPaused`| The contract or `withdraw_dispute` is paused                                                    |
+| Error | Code | When |
+| --- | --- | --- |
+| `EscrowError::DuplicateReference` | `230` | `create_escrow_with_reference`: the merchant already has an escrow with this reference |
+| `EscrowError::NotFound` | `200` | `get_escrow_by_reference`: the merchant has no escrow with this reference |
+
+`create_escrow_with_reference` can also return every error `create_escrow` returns.
 
 ### Events
 
-| Event                | Fields                                                  | When                                           |
-| -------------------- | ------------------------------------------------------- | ---------------------------------------------- |
-| `DisputeWithdrawn`   | `escrow_id`, `withdrawn_by`, `collateral_returned`      | Always on success (`collateral_returned` may be `0`) |
-| `CollateralReturned` | `escrow_id`, `party`, `amount`                          | Only when dispute collateral was held          |
-
----
-
-## Per-Token Fee Configuration
-
-`set_escrow_fee_config` sets one global fee for every token. Since fee economics differ between tokens (for example XLM and USDC), an admin can override the global config for a specific token.
-
-```
-set_token_escrow_fee_config(admin, token, config) -> ()
-remove_token_escrow_fee_config(admin, token) -> ()
-get_token_escrow_fee_config(token) -> Option<EscrowFeeConfig>
-get_effective_escrow_fee_config(token) -> EscrowFeeConfig
-```
-
-| Parameter | Type              | Description                                                               |
-| --------- | ----------------- | ------------------------------------------------------------------------- |
-| `admin`   | `Address`         | A multisig admin. Must authorize the call.                                |
-| `token`   | `Address`         | The token contract the override applies to.                               |
-| `config`  | `EscrowFeeConfig` | `fee_bps` (`0..=10000`), `fee_recipient`, and `enabled` for this token.   |
-
-### Precedence
-
-Fee lookups use the token-specific config if one is set, otherwise the global config. The override replaces the global config entirely for that token, so an override with `enabled: false` means no fee for that token even when the global config is enabled.
-
-- **Fee rate**: resolved when the escrow is created and snapshotted into `Escrow.fee_bps`. Changing either config later does not re-price existing escrows.
-- **Fee recipient**: resolved from the effective config for the escrow's token when fees are paid out at release.
-
-`remove_token_escrow_fee_config` deletes the override, and the token falls back to the global config. `get_effective_escrow_fee_config` returns whichever config currently applies to a token.
-
-### Accumulated fees
-
-When the effective `fee_recipient` is the escrow contract itself, collected fees are accrued per token. `get_accumulated_escrow_fees(token)` returns the balance for that token only, and `withdraw_escrow_fees(admin, token, to)` withdraws only that token's balance. When the recipient is an external address, fees are transferred directly and are not accrued.
-
-### Errors
-
-| Error                        | Cause                                                        |
-| ---------------------------- | ------------------------------------------------------------ |
-| `BasicError::NotAnAdmin`     | Caller is not in the multisig admin set (set and remove)     |
-| `BasicError::InvalidBps`     | `config.fee_bps` is outside `0..=10000` (set)                |
-| `BasicError::ContractPaused` | The contract or the function is paused                       |
-
-### Events
-
-| Event                         | Fields                         | Emitted by                        |
-| ----------------------------- | ------------------------------ | --------------------------------- |
-| `TokenEscrowFeeConfigUpdated` | `token`, `fee_bps`, `enabled`  | `set_token_escrow_fee_config`     |
-| `TokenEscrowFeeConfigRemoved` | `token`                        | `remove_token_escrow_fee_config`  |
+| Event | Topic | Payload fields | Fires when |
+| --- | --- | --- | --- |
+| `EscrowReferenceSet` | `escrow_reference_set` | `escrow_id`, `merchant`, `reference` | `create_escrow_with_reference` succeeds, alongside `EscrowCreated` |
 
 ---
 
