@@ -19,10 +19,22 @@ fn test_policy_version_increments() {
     let (client, _) = setup(&env);
     let merchant = Address::generate(&env);
 
-    let tiers1 = Vec::from_array(&env, [RefundTier { days_from_purchase: 1, max_refund_bps: 10000 }]);
+    let tiers1 = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 1,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers1);
 
-    let tiers2 = Vec::from_array(&env, [RefundTier { days_from_purchase: 2, max_refund_bps: 5000 }]);
+    let tiers2 = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 2,
+            max_refund_bps: 5000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers2);
 
     let v1 = client.get_refund_policy_version(&merchant, &1u32).unwrap();
@@ -42,19 +54,35 @@ fn test_policy_at_time() {
     let merchant = Address::generate(&env);
 
     env.ledger().set_timestamp(1000);
-    let tiers1 = Vec::from_array(&env, [RefundTier { days_from_purchase: 1, max_refund_bps: 10000 }]);
+    let tiers1 = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 1,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers1);
 
     env.ledger().set_timestamp(2000);
-    let tiers2 = Vec::from_array(&env, [RefundTier { days_from_purchase: 2, max_refund_bps: 5000 }]);
+    let tiers2 = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 2,
+            max_refund_bps: 5000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers2);
 
     // At t=1500 only v1 existed
-    let at_1500 = client.get_refund_policy_at_time(&merchant, &1500u64).unwrap();
+    let at_1500 = client
+        .get_refund_policy_at_time(&merchant, &1500u64)
+        .unwrap();
     assert_eq!(at_1500.version, 1);
 
     // At t=2500 v2 is active
-    let at_2500 = client.get_refund_policy_at_time(&merchant, &2500u64).unwrap();
+    let at_2500 = client
+        .get_refund_policy_at_time(&merchant, &2500u64)
+        .unwrap();
     assert_eq!(at_2500.version, 2);
 }
 
@@ -65,13 +93,31 @@ fn test_policy_history_append_only() {
     let (client, _) = setup(&env);
     let merchant = Address::generate(&env);
 
-    let tiers1 = Vec::from_array(&env, [RefundTier { days_from_purchase: 1, max_refund_bps: 10000 }]);
+    let tiers1 = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 1,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers1);
 
-    let tiers2 = Vec::from_array(&env, [RefundTier { days_from_purchase: 2, max_refund_bps: 5000 }]);
+    let tiers2 = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 2,
+            max_refund_bps: 5000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers2);
 
-    let tiers3 = Vec::from_array(&env, [RefundTier { days_from_purchase: 3, max_refund_bps: 2000 }]);
+    let tiers3 = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 3,
+            max_refund_bps: 2000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers3);
 
     let history = client.get_refund_policy_history(&merchant);

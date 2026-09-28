@@ -5,6 +5,9 @@ This contract manages secure, conditional fund holding for the Facil-Pay ecosyst
 ## Public Functions
 
 - create_escrow: Initializes a new escrow agreement with locked funds, terms, and designated participants.
+- create_escrow_with_reference: Same as create_escrow, but links the escrow to an off-chain order reference that is unique per merchant. See [Order References](#order-references).
+- get_escrow_by_reference: Looks up an escrow by merchant and order reference.
+- get_escrow_reference: Returns the order reference an escrow was created with, if any.
 - release_escrow: Releases the held funds to the recipient once the agreed-upon conditions are successfully met.
 - dispute_escrow: Flags the escrow transaction for administrative arbitration if participants cannot reach a consensus.
 - clawback: Admin-only emergency fund recovery. Initiates, executes, or cancels a time-delayed transfer of escrow funds to the admin address.
@@ -24,6 +27,37 @@ The escrow dispute flow has two separate timeout paths, and they apply in differ
 - Appeal expiry applies only after the dispute has entered the Appeal round. An appeal can be filed only while the dispute round is not Final and the time since `dispute_started_at` is still within the 72-hour appeal window. The appeal stores `appeal_deadline = filed_at + 259200`, and if that deadline passes without a resolution, `expire_appeal` rejects the pending appeal, advances the dispute round to Final, and leaves the prior outcome as the effective final disposition.
 
 These are distinct timers rather than one combined timeout. Escalation timeout is measured from the escalation timestamp on a disputed escrow, while appeal expiry is measured from the appeal filing deadline in the Appeal round. In practice, they are not both expected to fire for the same dispute state: the escalation path resolves the Disputed state before a valid appeal round is entered, and the appeal-expiry path only exists once an appeal has already been filed.
+
+---
+
+## Order References
+
+An escrow can be linked to an off-chain order in a verifiable way by creating it with a 32-byte reference, typically a hash of the merchant's order ID. Each reference is unique per merchant and stays bound to its escrow for the escrow's whole lifetime, including after it is released, refunded or cancelled. Two different merchants may use the same reference.
+
+### Functions
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `create_escrow_with_reference` | `customer`, `merchant`, `amount`, `token`, `release_timestamp`, `min_hold_period`, `expiry_timestamp`, `auto_refund_on_expiry` (all as in `create_escrow`), `reference: BytesN<32>` | `Result<u64, Error>`: the new escrow ID |
+| `get_escrow_by_reference` | `merchant: Address`, `reference: BytesN<32>` | `Result<Escrow, Error>`: the matching escrow |
+| `get_escrow_reference` | `escrow_id: u64` | `Option<BytesN<32>>`: `None` for escrows created without a reference |
+
+`create_escrow_with_reference` requires the customer's authorization and is blocked while `create_escrow` is paused. The duplicate check runs before any funds move, so a rejected call transfers nothing. `create_escrow` is unchanged and creates escrows without a reference.
+
+### Errors
+
+| Error | Code | When |
+| --- | --- | --- |
+| `EscrowError::DuplicateReference` | `230` | `create_escrow_with_reference`: the merchant already has an escrow with this reference |
+| `EscrowError::NotFound` | `200` | `get_escrow_by_reference`: the merchant has no escrow with this reference |
+
+`create_escrow_with_reference` can also return every error `create_escrow` returns.
+
+### Events
+
+| Event | Topic | Payload fields | Fires when |
+| --- | --- | --- | --- |
+| `EscrowReferenceSet` | `escrow_reference_set` | `escrow_id`, `merchant`, `reference` | `create_escrow_with_reference` succeeds, alongside `EscrowCreated` |
 
 ---
 
