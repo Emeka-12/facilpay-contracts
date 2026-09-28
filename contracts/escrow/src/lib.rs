@@ -41,6 +41,7 @@ pub enum ConfigKey {
     SchemaVersion,
     TrustedBridge(Address),
     EvidenceDeadlineConfig,
+    TokenEscrowFeeConfig(Address),
 }
 
 #[derive(Clone)]
@@ -116,6 +117,7 @@ pub enum DisputeKey {
     EscalationQueueIndex,
     EscalationDeadline(u64),
     AppealRecord(u64, u64),
+    DisputeOpener(u64),
 }
 
 #[derive(Clone)]
@@ -344,6 +346,20 @@ pub struct EscrowFeesWithdrawn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowFeeConfigUpdated {
     pub fee_bps: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenEscrowFeeConfigUpdated {
+    pub token: Address,
+    pub fee_bps: i128,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenEscrowFeeConfigRemoved {
+    pub token: Address,
 }
 
 #[contracttype]
@@ -635,6 +651,14 @@ pub struct MultiTokenEscrowReleased {
 pub struct EscrowDisputed {
     pub escrow_id: u64,
     pub disputed_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeWithdrawn {
+    pub escrow_id: u64,
+    pub withdrawn_by: Address,
+    pub collateral_returned: i128,
 }
 
 #[contractevent]
@@ -1716,6 +1740,121 @@ impl EscrowContract {
                 fee_recipient: env.current_contract_address(),
                 enabled: false,
             })
+    }
+
+    /// Sets a token-specific escrow fee config that overrides the global one.
+    ///
+    /// The override replaces the global config entirely for escrows in `token`,
+    /// including `enabled` and `fee_recipient`. The fee rate is snapshotted
+    /// into each escrow at creation; the recipient is resolved at release.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `admin` - Address of a multisig admin.
+    /// * `token` - Address of the token contract the config applies to.
+    /// * `config` - Fee configuration for `token`.
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success or `Err(Error)` on failure.
+    ///
+    /// # Errors
+    /// Returns `NotAnAdmin` if `admin` is not a multisig admin.
+    /// Returns `InvalidBps` if `config.fee_bps` is outside `0..=10000`.
+    pub fn set_token_escrow_fee_config(
+        env: Env,
+        admin: Address,
+        token: Address,
+        config: EscrowFeeConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_not_paused(&env, "set_token_escrow_fee_config")?;
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        if !(0..=10000).contains(&config.fee_bps) {
+            return Err(Error::Basic(BasicError::InvalidBps));
+        }
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::TokenEscrowFeeConfig(token.clone())),
+            &config,
+        );
+        TokenEscrowFeeConfigUpdated {
+            token,
+            fee_bps: config.fee_bps,
+            enabled: config.enabled,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Removes a token-specific escrow fee config so `token` falls back to the
+    /// global config.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `admin` - Address of a multisig admin.
+    /// * `token` - Address of the token contract.
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success or `Err(Error)` on failure.
+    ///
+    /// # Errors
+    /// Returns `NotAnAdmin` if `admin` is not a multisig admin.
+    pub fn remove_token_escrow_fee_config(
+        env: Env,
+        admin: Address,
+        token: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_not_paused(&env, "remove_token_escrow_fee_config")?;
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::Config(ConfigKey::TokenEscrowFeeConfig(
+                token.clone(),
+            )));
+        TokenEscrowFeeConfigRemoved { token }.publish(&env);
+        Ok(())
+    }
+
+    /// Returns the token-specific escrow fee config, if one is set.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `token` - Address of the token contract.
+    ///
+    /// # Returns
+    /// `Some(EscrowFeeConfig)` if an override exists for `token`, `None` otherwise.
+    pub fn get_token_escrow_fee_config(env: Env, token: Address) -> Option<EscrowFeeConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::TokenEscrowFeeConfig(token)))
+    }
+
+    /// Returns the escrow fee config that applies to `token`: the token-specific
+    /// config if set, otherwise the global config.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `token` - Address of the token contract.
+    ///
+    /// # Returns
+    /// The effective EscrowFeeConfig for `token`.
+    pub fn get_effective_escrow_fee_config(env: Env, token: Address) -> EscrowFeeConfig {
+        Self::effective_fee_config(&env, &token)
+    }
+
+    fn effective_fee_config(env: &Env, token: &Address) -> EscrowFeeConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::TokenEscrowFeeConfig(
+                token.clone(),
+            )))
+            .unwrap_or_else(|| Self::get_escrow_fee_config(env.clone()))
     }
 
     /// Returns accumulated escrow fees.
@@ -2843,7 +2982,7 @@ impl EscrowContract {
             .unwrap_or(0);
         let escrow_id = counter + 1;
 
-        let fee_config = Self::get_escrow_fee_config(env.clone());
+        let fee_config = Self::effective_fee_config(&env, &token);
         let fee_bps = if fee_config.enabled {
             fee_config.fee_bps
         } else {
@@ -3940,7 +4079,7 @@ impl EscrowContract {
         let merchant_amount = escrow.amount - fee_amount;
 
         if fee_amount > 0 {
-            let fee_config = Self::get_escrow_fee_config(env.clone());
+            let fee_config = Self::effective_fee_config(&env, &escrow.token);
             EscrowContract::transfer_if_token_contract(
                 &env,
                 &escrow.token,
@@ -4202,6 +4341,10 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::DisputeOpener(escrow_id)),
+            &caller,
+        );
 
         // Update global analytics
         let mut analytics: EscrowAnalytics = env
@@ -4232,6 +4375,101 @@ impl EscrowContract {
         EscrowDisputed {
             escrow_id,
             disputed_by: caller,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Withdraws an open dispute, e.g. after the parties settle privately.
+    ///
+    /// Only the party that opened the dispute may withdraw it, and only while
+    /// it is unresolved. The escrow returns to `Locked`, any pending
+    /// escalation is dequeued, and dispute collateral is returned in full to
+    /// the disputing party. Dispute analytics are not rolled back.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `caller` - The party that opened the dispute.
+    /// * `escrow_id` - Identifier for the disputed escrow.
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success or `Err(Error)` on failure.
+    ///
+    /// # Errors
+    /// Returns `NotFound` if the escrow does not exist.
+    /// Returns `NotDisputed` if the escrow is not currently disputed (including
+    /// disputes that have already been resolved).
+    /// Returns `Unauthorized` if `caller` did not open the dispute.
+    pub fn withdraw_dispute(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env, "withdraw_dispute")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::Action(ActionError::NotDisputed));
+        }
+
+        let collateral: Option<DisputeCollateral> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::Collateral(escrow_id)));
+        // Disputes opened before the opener was recorded fall back to the
+        // collateral record, which also names the disputing party.
+        let opener: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::DisputeOpener(escrow_id)))
+            .or_else(|| collateral.as_ref().map(|c| c.disputing_party.clone()));
+        if opener != Some(caller.clone()) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        escrow.status = EscrowStatus::Locked;
+        escrow.evidence_deadline = None;
+        escrow.escalated_at = None;
+        escrow.escalation_level = 0;
+        escrow.last_activity_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        env.storage()
+            .instance()
+            .remove(&DataKey::Dispute(DisputeKey::DisputeOpener(escrow_id)));
+        Self::dequeue_escalation(&env, escrow_id);
+
+        let mut collateral_returned = 0;
+        if let Some(collateral) = collateral {
+            let token_client = token::Client::new(&env, &collateral.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &collateral.disputing_party,
+                &collateral.amount,
+            );
+            env.storage()
+                .instance()
+                .remove(&DataKey::Dispute(DisputeKey::Collateral(escrow_id)));
+            collateral_returned = collateral.amount;
+            CollateralReturned {
+                escrow_id,
+                party: collateral.disputing_party,
+                amount: collateral.amount,
+            }
+            .publish(&env);
+        }
+
+        DisputeWithdrawn {
+            escrow_id,
+            withdrawn_by: caller,
+            collateral_returned,
         }
         .publish(&env);
 
@@ -6394,7 +6632,7 @@ impl EscrowContract {
             .unwrap_or(0);
         let escrow_id = counter + 1;
 
-        let fee_config = Self::get_escrow_fee_config(env.clone());
+        let fee_config = Self::effective_fee_config(&env, &token);
         let fee_bps = if fee_config.enabled {
             fee_config.fee_bps
         } else {
@@ -7261,7 +7499,7 @@ impl EscrowContract {
                 let merchant_amount = escrow.amount - fee_amount;
 
                 if fee_amount > 0 {
-                    let fee_config = EscrowContract::get_escrow_fee_config(env.clone());
+                    let fee_config = EscrowContract::effective_fee_config(env, &escrow.token);
                     EscrowContract::transfer_if_token_contract(
                         env,
                         &escrow.token,
@@ -9361,7 +9599,7 @@ impl EscrowContract {
 
         let current_timestamp = env.ledger().timestamp();
 
-        let fee_config = Self::get_escrow_fee_config(env.clone());
+        let fee_config = Self::effective_fee_config(&env, &token);
         let fee_bps = if fee_config.enabled {
             fee_config.fee_bps
         } else {
@@ -9485,7 +9723,7 @@ impl EscrowContract {
             let merchant_amount = escrow.amount - fee_amount;
 
             if fee_amount > 0 {
-                let fee_config = Self::get_escrow_fee_config(env.clone());
+                let fee_config = Self::effective_fee_config(&env, &escrow.token);
                 EscrowContract::transfer_if_token_contract(
                     &env,
                     &escrow.token,
@@ -11151,7 +11389,7 @@ impl EscrowContract {
         let merchant_amount = sub.amount - fee_amount;
 
         if fee_amount > 0 {
-            let fee_config = Self::get_escrow_fee_config(env.clone());
+            let fee_config = Self::effective_fee_config(&env, &escrow.token);
             EscrowContract::transfer_if_token_contract(
                 &env,
                 &escrow.token,
@@ -11812,3 +12050,9 @@ mod reference_test;
 //
 // #[cfg(test)]
 // mod test_sub_account;
+
+#[cfg(test)]
+mod withdraw_dispute_test;
+
+#[cfg(test)]
+mod token_fee_config_test;

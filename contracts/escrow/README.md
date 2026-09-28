@@ -10,6 +10,8 @@ This contract manages secure, conditional fund holding for the Facil-Pay ecosyst
 - get_escrow_reference: Returns the order reference an escrow was created with, if any.
 - release_escrow: Releases the held funds to the recipient once the agreed-upon conditions are successfully met.
 - dispute_escrow: Flags the escrow transaction for administrative arbitration if participants cannot reach a consensus.
+- withdraw_dispute: Lets the party that opened a dispute withdraw it before resolution, returning the escrow to `Locked` and refunding any dispute collateral.
+- set_token_escrow_fee_config: Admin-only. Sets a fee config for one token that overrides the global escrow fee config.
 - clawback: Admin-only emergency fund recovery. Initiates, executes, or cancels a time-delayed transfer of escrow funds to the admin address.
 - approve_multisig: Records an approval signature from a required participant for multi-signature escrow setups.
 - add_observer: Assigns a read-only role to a specific address for auditing and compliance tracking.
