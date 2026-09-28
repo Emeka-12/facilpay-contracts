@@ -265,7 +265,13 @@ fn test_admin_override_policy_successfully() {
 
     // Then admin overrides policy
     let reason = String::from_str(&env, "Manual override for special case");
-    client.admin_override_policy(&admin, &refund_id, &RefundStatus::Approved, &1000i128, &reason);
+    client.admin_override_policy(
+        &admin,
+        &refund_id,
+        &RefundStatus::Approved,
+        &1000i128,
+        &reason,
+    );
 
     // Check that the override event was emitted
     let events = env.events().all();
@@ -303,7 +309,13 @@ fn test_admin_override_policy_by_non_admin_should_fail() {
 
     // Try to override with unauthorized user
     let reason = String::from_str(&env, "Unauthorized override");
-    client.admin_override_policy(&unauthorized_user, &refund_id, &RefundStatus::Approved, &1000i128, &reason);
+    client.admin_override_policy(
+        &unauthorized_user,
+        &refund_id,
+        &RefundStatus::Approved,
+        &1000i128,
+        &reason,
+    );
 }
 
 #[test]

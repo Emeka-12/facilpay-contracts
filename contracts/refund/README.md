@@ -38,7 +38,7 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 ### Initialization & Schema
 
 - `initialize()` — Initializes the contract with an admin address and default refund/appeal windows.
-- `get_schema_version()` — Returns the current schema version number.
+- `get_schema_version()` — Returns the current schema version number. New deployments start at `2` (v2 added the `Withdrawn` refund status); deployments that predate schema tracking report `1`.
 - `migrate_schema()` — Admin-only migration of the contract schema to a new version.
 
 ### Core Refund Lifecycle
@@ -51,6 +51,63 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `reject_refund()` — Admin rejects a refund (moves from Requested to PendingAppeal).
 - `finalize_denial()` — Finalizes a denied refund after the appeal window expires.
 - `process_refund()` — Processes an approved refund, deducting platform fees.
+- `withdraw_refund_request()` — Customer withdraws a refund still in `Requested` status. See [Withdrawing a Refund Request](#withdrawing-a-refund-request).
+- `counter_offer()` — Merchant offers a smaller refund than requested. See [Counter-Offers](#counter-offers).
+- `accept_counter_offer()` — Customer accepts the merchant's counter-offer, approving the refund at the offered amount.
+- `get_counter_offer()` — Gets the pending counter-offer for a refund, if any.
+
+### Withdrawing a Refund Request
+
+A customer who filed a refund by mistake can withdraw it while it is still `Requested`.
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `withdraw_refund_request` | `customer: Address` (must authorize), `refund_id: u64` | `Result<(), Error>` |
+
+On success the refund moves to the terminal `Withdrawn` status, and several side effects follow:
+
+- The request's per-payment refund-cap usage (count and amount) is released.
+- Any pending counter-offer is discarded, and so is any response-SLA deadline.
+- Withdrawn refunds are not counted as pending in `get_merchant_refund_summary`.
+
+Customer rate-limit and cooldown counters are **not** released. Otherwise a customer could file and withdraw requests to get around those limits.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::RefundNotFound` | `2` | No refund with this ID |
+| `CoreError::Unauthorized` | `3` | Caller is not the refund's customer |
+| `CoreError::InvalidStatus` | `7` | Refund is not `Requested` (e.g. already approved, processed, rejected or withdrawn) |
+| `CoreError::FunctionPaused` / `ContractPaused` | `18` / `17` | The contract or `withdraw_refund_request` is paused |
+
+Emits `RefundWithdrawn`.
+
+### Counter-Offers
+
+Merchants can counter a refund request with a partial amount instead of only approving or rejecting it.
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `counter_offer` | `merchant: Address` (must authorize), `refund_id: u64`, `amount: i128` | `Result<(), Error>` |
+| `accept_counter_offer` | `customer: Address` (must authorize), `refund_id: u64` | `Result<(), Error>` |
+| `get_counter_offer` | `refund_id: u64` | `Option<CounterOffer>` (`refund_id`, `merchant`, `amount`, `offered_at`, `expires_at`) |
+
+- **Making an offer.** The refund must be `Requested`, and `amount` must be greater than `0` and less than the requested amount. The offer stays open for 7 days (`expires_at = offered_at + 604800`). A new offer replaces the previous one.
+- **Accepting an offer.** The customer can accept up to and including `expires_at`. The refund's `amount` is set to the offered amount, and the per-payment refund-cap usage shrinks to match. The refund is then approved (`approved_by` is the merchant), so `process_refund()` pays out the accepted amount.
+- **Expiry.** An expired offer can no longer be accepted, and the original request stays `Requested` at its original amount. The admin can still approve or reject it, and the merchant can make a new offer.
+- **Other decisions.** Approving, rejecting, TTL-expiring or withdrawing the refund discards any pending offer.
+- **Response SLA.** A counter-offer does not stop the merchant's response-SLA clock.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::RefundNotFound` | `2` | No refund with this ID |
+| `CoreError::Unauthorized` | `3` | `counter_offer`: caller is not the refund's merchant. `accept_counter_offer`: caller is not the refund's customer |
+| `CoreError::InvalidStatus` | `7` | Refund is not `Requested` |
+| `CoreError::RefundWindowExpired` | `11` | `accept_counter_offer`: the refund's TTL has expired |
+| `ExtError::InvalidCounterOffer` | `64` | `counter_offer`: `amount <= 0` or `amount >= requested amount` |
+| `ExtError::CounterOfferNotFound` | `65` | `accept_counter_offer`: no offer is pending |
+| `ExtError::CounterOfferExpired` | `66` | `accept_counter_offer`: the offer's `expires_at` has passed |
+
+Emits `CounterOfferMade` from `counter_offer`. Emits `CounterOfferAccepted` and `RefundApproved` from `accept_counter_offer`.
 
 ### Appeals
 
@@ -397,7 +454,35 @@ Errors: `SlaNotConfigured` (62) if the refund has no recorded deadline, `SlaNotB
 - `issue_refund_voucher()` — Admin issues a refund credit voucher for an approved refund.
 - `redeem_refund_voucher()` — Customer redeems a refund voucher against a future payment.
 - `get_voucher()` — Gets a refund voucher by ID.
-- `get_customer_vouchers()` — Gets all refund vouchers issued to a customer.
+- `get_customer_vouchers()` — Gets all refund vouchers currently owned by a customer.
+- `transfer_voucher()` — Owner transfers an unredeemed, unexpired voucher to another address.
+- `set_vouchers_transferable()` — Merchant chooses whether vouchers for its refunds are issued transferable.
+- `get_vouchers_transferable()` — Whether a merchant's new vouchers are issued transferable (default `true`).
+- `is_voucher_transferable()` — Whether a specific voucher can be transferred.
+
+#### Voucher transfers
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `transfer_voucher` | `owner: Address` (must authorize), `voucher_id: u64`, `new_owner: Address` | `Result<(), Error>` |
+| `set_vouchers_transferable` | `merchant: Address` (must authorize), `transferable: bool` | `Result<(), Error>` |
+| `get_vouchers_transferable` | `merchant: Address` | `bool` |
+| `is_voucher_transferable` | `voucher_id: u64` | `bool` |
+
+A transfer sets the voucher's `customer` field to `new_owner`. It also moves the voucher from the old owner's `get_customer_vouchers()` list to the new owner's. After a transfer, only the new owner can redeem the voucher or transfer it again.
+
+The merchant's `set_vouchers_transferable` setting is snapshotted onto each voucher when `issue_refund_voucher()` runs. Changing the setting later does not affect vouchers that already exist. The owner of a non-transferable voucher can still redeem it.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::Unauthorized` | `3` | Caller does not own the voucher |
+| `ExtError::VoucherNotFound` | `52` | No voucher with this ID |
+| `ExtError::VoucherExpired` | `53` | Ledger time is past the voucher's `expires_at` |
+| `ExtError::VoucherAlreadyRedeemed` | `54` | The voucher has been redeemed |
+| `ExtError::VoucherNotTransferable` | `67` | The voucher was issued while its merchant had transfers disabled |
+| `ExtError::InvalidVoucherRecipient` | `68` | `new_owner` is the current owner |
+
+Emits `VoucherTransferred` from `transfer_voucher`, and `VoucherTransferabilitySet` from `set_vouchers_transferable`.
 
 #### Voucher expiry and value handling
 
@@ -516,6 +601,16 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `RefundApproved`  | `RefundApproved`  | `refund_id`, `payment_id`, `amount`, `approved_by`, `approved_at`          | `approve_refund()` moves refund to `Approved` status                 |
 | `RefundRejected`  | `RefundRejected`  | `refund_id`, `rejected_by`, `rejected_at`, `rejection_reason`              | `reject_refund()` moves refund to `PendingAppeal` status             |
 | `RefundProcessed` | `RefundProcessed` | `refund_id`, `processed_by`, `customer`, `amount`, `token`, `processed_at` | `process_refund()` executes approved refund and moves to `Processed` |
+| `RefundWithdrawn` | `refund_withdrawn` | `refund_id`, `payment_id`, `customer`, `amount`, `withdrawn_at` | `withdraw_refund_request()` moves refund to `Withdrawn` status |
+| `CounterOfferMade` | `counter_offer_made` | `refund_id`, `merchant`, `requested_amount`, `offered_amount`, `expires_at` | `counter_offer()` records a merchant counter-offer |
+| `CounterOfferAccepted` | `counter_offer_accepted` | `refund_id`, `customer`, `requested_amount`, `accepted_amount` | `accept_counter_offer()` approves the refund at the offered amount |
+
+### Voucher Events
+
+| Event | Topic Name | Payload Fields | Fires When |
+| --- | --- | --- | --- |
+| `VoucherTransferred` | `voucher_transferred` | `voucher_id`, `from`, `to` | `transfer_voucher()` moves a voucher to a new owner |
+| `VoucherTransferabilitySet` | `voucher_transferability_set` | `merchant`, `transferable` | `set_vouchers_transferable()` changes a merchant's voucher setting |
 
 ### Auto-Refund Trigger Events
 
