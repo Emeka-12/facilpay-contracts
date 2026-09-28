@@ -12981,3 +12981,6 @@ mod schema_version_test;
 
 #[cfg(test)]
 mod test_glossary;
+
+#[cfg(test)]
+mod test_routed_payment;
