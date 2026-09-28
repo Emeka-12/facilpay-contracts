@@ -336,11 +336,35 @@ to request again.
 - `get_next_arbitrators()` — Previews the next arbitrators without advancing the rotation.
 - `reset_rotation_index()` — Admin resets the round-robin rotation index.
 
+### Arbitrator Availability
+
+Unavailable arbitrators are skipped by `escalate_to_arbitration`, `auto_assign_arbitrators` and `get_next_arbitrators`, and `assign_arbitrator` rejects them with `ArbitratorUnavailable` (61). They keep their seats and votes on cases they are already assigned to.
+
+- `set_arbitrator_availability()` — Arbitrator opts in or out of new case assignments.
+- `admin_set_arbitrator_availability()` — Admin overrides an arbitrator's availability.
+- `is_arbitrator_available()` — Returns whether a registered arbitrator accepts new cases.
+- `get_available_arbitrators()` — Lists registered arbitrators currently accepting cases.
+
 ### Refund TTL
 
 - `set_refund_ttl_config()` — Admin sets the default TTL for refund requests.
 - `expire_stale_refund()` — Expires a refund that exceeded its TTL.
 - `get_expired_refunds()` — Gets refund IDs that have expired past TTL.
+
+### Merchant Response SLA
+
+When an SLA is active, each refund created in `Requested` status records a response deadline (`requested_at + response_sla_seconds`). Later config changes do not move that deadline. Once it passes and the refund is still `Requested`, anyone can call `auto_approve_on_sla_breach`. The refund then moves to `Approved` with the contract address as the approver. A TTL that expired first takes precedence and the call returns `RefundWindowExpired`.
+
+- `set_response_sla_config()` — Admin sets the platform-wide response SLA.
+- `get_response_sla_config()` — Gets the platform-wide response SLA.
+- `set_merchant_response_sla()` — Admin sets a per-merchant SLA override (can also disable it for that merchant).
+- `remove_merchant_response_sla()` — Admin removes a merchant override.
+- `get_merchant_response_sla()` — Gets the effective SLA seconds for a merchant.
+- `get_refund_sla_deadline()` — Gets the response deadline recorded for a refund.
+- `auto_approve_on_sla_breach()` — Permissionless: auto-approves a refund past its SLA deadline.
+- `get_sla_breached_refunds()` — Lists `Requested` refunds whose SLA has passed.
+
+Errors: `SlaNotConfigured` (62) if the refund has no recorded deadline, `SlaNotBreached` (63) if the deadline hasn't passed.
 
 ### Dispute Evidence
 
