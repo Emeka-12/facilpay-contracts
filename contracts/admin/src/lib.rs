@@ -316,4 +316,173 @@ mod test {
         client.emergency_pause_all(&pauser, &reason);
         client.emergency_unpause_all(&pauser);
     }
+
+    /// Registers the admin contract and three child contracts (all administered by
+    /// `pauser`), then initializes the admin contract.
+    /// Returns (client, admin, pauser, payment, escrow, refund).
+    fn setup_initialized(
+        env: &Env,
+    ) -> (
+        AdminContractClient<'_>,
+        Address,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
+        let admin_contract_id = env.register(AdminContract, ());
+        let client = AdminContractClient::new(env, &admin_contract_id);
+
+        let admin = Address::generate(env);
+        let pauser = Address::generate(env);
+        let payment_contract = setup_payment(env, &pauser);
+        let escrow_contract = setup_escrow(env, &pauser);
+        let refund_contract = setup_refund(env, &pauser);
+
+        client.initialize(
+            &admin,
+            &pauser,
+            &payment_contract,
+            &escrow_contract,
+            &refund_contract,
+        );
+
+        (
+            client,
+            admin,
+            pauser,
+            payment_contract,
+            escrow_contract,
+            refund_contract,
+        )
+    }
+
+    #[test]
+    fn test_initialize_twice_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, admin, pauser, payment_contract, escrow_contract, refund_contract) =
+            setup_initialized(&env);
+
+        let result = client.try_initialize(
+            &admin,
+            &pauser,
+            &payment_contract,
+            &escrow_contract,
+            &refund_contract,
+        );
+        assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn test_pause_and_unpause_all_updates_child_contracts() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin, pauser, payment_contract, escrow_contract, refund_contract) =
+            setup_initialized(&env);
+        let payment = PaymentContractClient::new(&env, &payment_contract);
+        let escrow = EscrowContractClient::new(&env, &escrow_contract);
+        let refund = RefundContractClient::new(&env, &refund_contract);
+
+        let reason = String::from_str(&env, "security incident");
+        client.emergency_pause_all(&pauser, &reason);
+
+        assert!(payment.get_pause_state().globally_paused);
+        assert!(escrow.get_pause_state().globally_paused);
+        assert!(refund.get_pause_state().globally_paused);
+        assert_eq!(payment.get_pause_state().pause_reason, reason);
+
+        client.emergency_unpause_all(&pauser);
+
+        assert!(!payment.get_pause_state().globally_paused);
+        assert!(!escrow.get_pause_state().globally_paused);
+        assert!(!refund.get_pause_state().globally_paused);
+    }
+
+    #[test]
+    fn test_pause_all_rejects_non_pauser_and_uninitialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Uninitialized contract returns NotInitialized.
+        let fresh_id = env.register(AdminContract, ());
+        let fresh = AdminContractClient::new(&env, &fresh_id);
+        let someone = Address::generate(&env);
+        let reason = String::from_str(&env, "incident");
+        assert_eq!(
+            fresh.try_emergency_pause_all(&someone, &reason),
+            Err(Ok(Error::NotInitialized))
+        );
+        assert_eq!(
+            fresh.try_emergency_unpause_all(&someone),
+            Err(Ok(Error::NotInitialized))
+        );
+
+        // Initialized contract rejects anyone but the stored pauser, including the admin.
+        let (client, admin, _pauser, payment_contract, _, _) = setup_initialized(&env);
+        assert_eq!(
+            client.try_emergency_pause_all(&admin, &reason),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            client.try_emergency_unpause_all(&someone),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert!(
+            !PaymentContractClient::new(&env, &payment_contract)
+                .get_pause_state()
+                .globally_paused
+        );
+    }
+
+    #[test]
+    fn test_contract_setters_admin_only_and_take_effect() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, admin, pauser, old_payment, old_escrow, old_refund) = setup_initialized(&env);
+        let new_payment = setup_payment(&env, &pauser);
+        let new_escrow = setup_escrow(&env, &pauser);
+        let new_refund = setup_refund(&env, &pauser);
+
+        // Non-admin callers (including the pauser) are rejected.
+        let stranger = Address::generate(&env);
+        assert_eq!(
+            client.try_set_payment_contract(&stranger, &new_payment),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            client.try_set_escrow_contract(&pauser, &new_escrow),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert_eq!(
+            client.try_set_refund_contract(&stranger, &new_refund),
+            Err(Ok(Error::Unauthorized))
+        );
+
+        // Setters on an uninitialized contract return NotInitialized.
+        let fresh_id = env.register(AdminContract, ());
+        let fresh = AdminContractClient::new(&env, &fresh_id);
+        assert_eq!(
+            fresh.try_set_payment_contract(&admin, &new_payment),
+            Err(Ok(Error::NotInitialized))
+        );
+
+        client.set_payment_contract(&admin, &new_payment);
+        client.set_escrow_contract(&admin, &new_escrow);
+        client.set_refund_contract(&admin, &new_refund);
+
+        // Pausing now targets the new contracts and leaves the old ones untouched.
+        client.emergency_pause_all(&pauser, &String::from_str(&env, "rotation"));
+
+        assert!(PaymentContractClient::new(&env, &new_payment).get_pause_state().globally_paused);
+        assert!(EscrowContractClient::new(&env, &new_escrow).get_pause_state().globally_paused);
+        assert!(RefundContractClient::new(&env, &new_refund).get_pause_state().globally_paused);
+
+        assert!(!PaymentContractClient::new(&env, &old_payment).get_pause_state().globally_paused);
+        assert!(!EscrowContractClient::new(&env, &old_escrow).get_pause_state().globally_paused);
+        assert!(!RefundContractClient::new(&env, &old_refund).get_pause_state().globally_paused);
+    }
 }
