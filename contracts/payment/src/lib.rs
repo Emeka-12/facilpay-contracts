@@ -69,14 +69,19 @@ pub enum PaymentKey {
     AccumulatedFees,
     LargePaymentCounter,
     Discount(u64),
-    // Issue #673: installment schedule
-    InstallmentSchedule(u64),
-    // Issue #674: hook counter and storage
-    NotificationHookCounter,
-    NotificationHook(u64),
+    Tip(u64),
+    StatusHistory(u64),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
+
+/// Upper bound on status-history entries kept per payment (#682). A payment's
+/// lifecycle has only a handful of transitions, so the oldest entry is dropped
+/// once this bound is reached.
+pub const MAX_STATUS_HISTORY: u32 = 10;
+
+/// Rolling window, in seconds, over which a merchant's skip cap is counted (#666).
+pub const SKIP_WINDOW_SECONDS: u64 = 365 * 86400;
 
 #[derive(Clone)]
 #[contracttype]
@@ -88,6 +93,7 @@ pub enum SubscriptionKey {
     Group(u64),
     GroupCounter,
     GroupMembership(u64),
+    SkipUsage(u64),
 }
 
 #[derive(Clone)]
@@ -223,6 +229,7 @@ pub enum SubscriptionError {
     MaxTrialDurationExceeded = 316,
     MerchantPaused = 317,
     UsageCapExceeded = 318,
+    SkipCapExceeded = 319,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -340,10 +347,8 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ProposalError>(code)
                 }));
             }
-            if (300..=318).contains(&code) {
-                return Ok(Error::Subscription(unsafe {
-                    core::mem::transmute::<u32, SubscriptionError>(code)
-                }));
+            if code >= 300 && code <= 319 {
+                return Ok(Error::Subscription(unsafe { core::mem::transmute(code) }));
             }
             if (200..=234).contains(&code) {
                 return Ok(Error::Payment(unsafe {
@@ -420,13 +425,7 @@ pub enum MerchantDataKey {
     MerchantActiveSubscriptions(Address, u64),
     MerchantActiveSubscriptionCount(Address),
     ActiveSubscriptionIndex(u64),
-    // Issue #672: per-merchant default expiry seconds
-    DefaultPaymentExpiry(Address),
-    // Issue #674: notification hook indices
-    HooksByEvent(PaymentEventType, u64),
-    HooksByEventCount(PaymentEventType),
-    SubscriberHooks(Address, u64),
-    SubscriberHookCount(Address),
+    SkipCap(Address),
 }
 
 // State and proposal data keys
@@ -535,6 +534,23 @@ pub struct Subscription {
     pub metadata: String,
     pub trial_data: SubscriptionTrialData,
     pub pause_data: SubscriptionPauseData,
+}
+
+/// One entry in a payment's status history (#682).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PaymentStatusEntry {
+    pub status: PaymentStatus,
+    pub timestamp: u64,
+    pub actor: Address,
+}
+
+/// Skips consumed by a subscription within the current rolling year (#666).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SubscriptionSkipUsage {
+    pub window_start: u64,
+    pub count: u32,
 }
 
 #[repr(u32)]
@@ -1027,6 +1043,46 @@ pub struct SubscriptionPaused {
 pub struct SubscriptionResumed {
     pub subscription_id: u64,
     pub next_payment_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionCycleSkipped {
+    pub subscription_id: u64,
+    pub customer: Address,
+    pub skipped_payment_at: u64,
+    pub next_payment_at: u64,
+    pub skips_used: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkipCapSet {
+    pub merchant: Address,
+    pub max_skips_per_year: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentTipAdded {
+    pub payment_id: u64,
+    pub tip_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentTipSettled {
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub tip_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentTipReturned {
+    pub payment_id: u64,
+    pub customer: Address,
+    pub tip_amount: i128,
 }
 
 #[contractevent]
@@ -2546,6 +2602,100 @@ impl PaymentContract {
         )
     }
 
+    /// Adds a fee-exempt tip for the merchant to a pending payment (#675).
+    ///
+    /// The tip is transferred from the customer into the contract immediately
+    /// and held alongside the payment; calling again adds to the existing tip.
+    /// On completion it is paid to the merchant in full (platform fees are
+    /// computed on `amount` only); on refund, cancellation or expiry it is
+    /// returned to the customer.
+    ///
+    /// # Arguments
+    /// * `customer` - The payment's customer (must authorize and fund the tip)
+    /// * `payment_id` - The pending payment to tip on
+    /// * `tip_amount` - The tip in base token units of the payment's token (`> 0`)
+    ///
+    /// # Returns
+    /// `Ok(total_tip)` on success, or `BasicError::InvalidAmount` if `tip_amount`
+    /// is not positive, `PaymentError::NotFound`, `BasicError::Unauthorized` if
+    /// `customer` is not the payment's customer, `PaymentError::Expired`, or
+    /// `PaymentError::InvalidStatus` if the payment is not `Pending` or is an
+    /// escrowed or split payment.
+    pub fn add_tip(
+        env: Env,
+        customer: Address,
+        payment_id: u64,
+        tip_amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "create_payment")?;
+        customer.require_auth();
+        if tip_amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        let payment: Payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        if payment.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+        if PaymentContract::is_payment_expired(&env, payment_id) {
+            return Err(Error::Payment(PaymentError::Expired));
+        }
+        // Escrowed and split payments settle outside `do_complete_payment`, so
+        // a tip on them could never reach the merchant.
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::State(StateDataKey::EscrowedPayment(payment_id)))
+            || env
+                .storage()
+                .instance()
+                .has(&DataKey::Feature(FeatureKey::SplitConfig(payment_id)))
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        token::Client::new(&env, &payment.token).transfer(
+            &customer,
+            env.current_contract_address(),
+            &tip_amount,
+        );
+        let total_tip = PaymentContract::get_tip(&env, payment_id) + tip_amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(PaymentKey::Tip(payment_id)), &total_tip);
+        (PaymentTipAdded {
+            payment_id,
+            tip_amount,
+        })
+        .publish(&env);
+        Ok(total_tip)
+    }
+
+    /// Returns the tip attached to a payment, or 0 if it has none (#675).
+    pub fn get_payment_tip(env: Env, payment_id: u64) -> i128 {
+        PaymentContract::get_tip(&env, payment_id)
+    }
+
+    /// Returns a payment's status history in chronological order (#682).
+    ///
+    /// Each entry records the status entered, the ledger timestamp and the
+    /// address that caused the transition. Permissionless transitions
+    /// (`expire_payment`, `finalize_installment_payment`, `execute_large_payment`,
+    /// `execute_if_condition_met`) record the contract's own address as actor.
+    /// At most `MAX_STATUS_HISTORY` entries are kept; older ones are dropped.
+    pub fn get_payment_status_history(env: Env, payment_id: u64) -> Vec<PaymentStatusEntry> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::StatusHistory(payment_id)))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Schedules a future payment by escrowing tokens until the scheduled time.
     ///
     /// # Arguments
@@ -2951,6 +3101,12 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Counter), &payment_id);
+        PaymentContract::record_status_change(
+            env,
+            payment_id,
+            PaymentStatus::Pending,
+            customer.clone(),
+        );
 
         // Index by customer
         let customer_count: u64 = env
@@ -3382,6 +3538,7 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, admin);
 
         (EscrowedPaymentCompleted {
             payment_id,
@@ -3438,6 +3595,7 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Cancelled, caller);
 
         (EscrowedPaymentCancelled {
             payment_id,
@@ -3589,6 +3747,12 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            payment.status.clone(),
+            admin.clone(),
+        );
         env.storage().instance().set(
             &DataKey::State(StateDataKey::EscrowedPaymentDispute(payment_id)),
             &dispute,
@@ -3848,6 +4012,9 @@ impl PaymentContract {
             token_client.transfer(&contract_address, &payment.customer, &refund_amount);
         }
 
+        // Return any escrowed tip (#675)
+        PaymentContract::return_tip(&env, &payment);
+
         // Update payment status to Cancelled
         payment.status = PaymentStatus::Cancelled;
         PaymentContract::restore_spend_limit(&env, &payment);
@@ -3856,6 +4023,13 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        // Expiry is permissionless, so the contract itself is the recorded actor.
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            PaymentStatus::Cancelled,
+            env.current_contract_address(),
+        );
 
         // Emit PaymentExpired event with refund info
         (PaymentExpired {
@@ -3945,10 +4119,10 @@ impl PaymentContract {
             return Err(Error::Proposal(ProposalError::RequiresMultiSig));
         }
 
-        PaymentContract::do_complete_payment(&env, payment_id)
+        PaymentContract::do_complete_payment(&env, payment_id, admin)
     }
 
-    fn do_complete_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
+    fn do_complete_payment(env: &Env, payment_id: u64, actor: Address) -> Result<(), Error> {
         // Check if payment exists
         if !env
             .storage()
@@ -4011,6 +4185,10 @@ impl PaymentContract {
             payment.currency.clone(),
         );
 
+        // The tip (#675) is already escrowed in the contract and is fee-exempt:
+        // it is added to the merchant's settlement after fees are computed.
+        let tip = PaymentContract::get_tip(env, payment_id);
+
         // Check finality delay config (#219)
         let finality: Option<FinalityConfig> = env
             .storage()
@@ -4023,7 +4201,7 @@ impl PaymentContract {
                 let settlement = PendingSettlement {
                     payment_id,
                     merchant: payment.merchant.clone(),
-                    amount: net_amount,
+                    amount: net_amount + tip,
                     token: payment.token.clone(),
                     release_at,
                 };
@@ -4054,6 +4232,20 @@ impl PaymentContract {
                 env.storage()
                     .instance()
                     .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+                PaymentContract::record_status_change(
+                    env,
+                    payment_id,
+                    PaymentStatus::Completed,
+                    actor,
+                );
+                if tip > 0 {
+                    (PaymentTipSettled {
+                        payment_id,
+                        merchant: payment.merchant.clone(),
+                        tip_amount: tip,
+                    })
+                    .publish(env);
+                }
                 PaymentContract::update_merchant_fee_record_post_completion(
                     env,
                     payment.merchant.clone(),
@@ -4111,8 +4303,16 @@ impl PaymentContract {
             env,
             payment.merchant.clone(),
             payment.token.clone(),
-            merchant_amount,
+            merchant_amount + tip,
         )?;
+        if tip > 0 {
+            (PaymentTipSettled {
+                payment_id,
+                merchant: payment.merchant.clone(),
+                tip_amount: tip,
+            })
+            .publish(env);
+        }
 
         // Forwarding only applies when funds were paid out immediately.
         let payout_deferred = env
@@ -4159,6 +4359,7 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(env, payment_id, PaymentStatus::Completed, actor);
         PaymentContract::update_merchant_fee_record_post_completion(
             env,
             payment.merchant.clone(),
@@ -4662,14 +4863,14 @@ impl PaymentContract {
             installment_number: new_installment_number,
             amount,
             remaining,
-            payer: customer,
+            payer: customer.clone(),
             paid_at: partial_payment.paid_at,
         })
         .publish(&env);
 
         // Check if payment is now fully paid
         if remaining == 0 {
-            PaymentContract::finalize_installment_payment(env.clone(), payment_id)?;
+            PaymentContract::do_finalize_installment_payment(&env, payment_id, customer.clone())?;
         }
 
         Ok(())
@@ -4769,6 +4970,17 @@ impl PaymentContract {
     /// `Ok(())` on success, or an error if the payment is not in Pending status or
     /// the outstanding balance is not zero.
     pub fn finalize_installment_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        // Permissionless entry point: the contract itself is the recorded actor.
+        let actor = env.current_contract_address();
+        PaymentContract::do_finalize_installment_payment(&env, payment_id, actor)
+    }
+
+    fn do_finalize_installment_payment(
+        env: &Env,
+        payment_id: u64,
+        actor: Address,
+    ) -> Result<(), Error> {
+        let env = env.clone();
         let mut payment = PaymentContract::get_payment(&env, payment_id);
 
         if payment.status != PaymentStatus::Pending {
@@ -4794,14 +5006,25 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, actor);
 
-        // Transfer or accumulate all collected funds to merchant
+        // Transfer or accumulate all collected funds (plus any escrowed,
+        // fee-exempt tip, #675) to the merchant
+        let tip = PaymentContract::get_tip(&env, payment_id);
         Self::settle_or_accumulate(
             &env,
             payment.merchant.clone(),
             payment.token.clone(),
-            payment.amount,
+            payment.amount + tip,
         )?;
+        if tip > 0 {
+            (PaymentTipSettled {
+                payment_id,
+                merchant: payment.merchant.clone(),
+                tip_amount: tip,
+            })
+            .publish(&env);
+        }
 
         // Emit payment fully paid event
         (PaymentFullyPaid {
@@ -4845,10 +5068,10 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        PaymentContract::do_refund_payment(&env, payment_id)
+        PaymentContract::do_refund_payment(&env, payment_id, admin)
     }
 
-    fn do_refund_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
+    fn do_refund_payment(env: &Env, payment_id: u64, actor: Address) -> Result<(), Error> {
         // Check if payment exists
         if !env
             .storage()
@@ -4884,11 +5107,13 @@ impl PaymentContract {
         // still-Pending payment before it becomes Refunded. A payment with no
         // installment history transfers nothing.
         PaymentContract::return_collected_installments(env, &payment, payment_id);
+        PaymentContract::return_tip(env, &payment);
         PaymentContract::restore_spend_limit(env, &payment);
 
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(env, payment_id, PaymentStatus::Refunded, actor);
 
         // Update analytics
         let mut analytics: PaymentAnalytics = env
@@ -5009,6 +5234,7 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::Expired));
         }
 
+        let previous_status = payment.status.clone();
         match payment.status {
             PaymentStatus::Pending | PaymentStatus::PartialRefunded => {
                 let new_refunded = payment.refunded_amount + refund_amount;
@@ -5027,9 +5253,17 @@ impl PaymentContract {
             }
         }
 
+        // A fully refunded payment also returns its escrowed tip (#675).
+        if payment.status == PaymentStatus::Refunded {
+            PaymentContract::return_tip(&env, &payment);
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        if payment.status != previous_status {
+            PaymentContract::record_status_change(&env, payment_id, payment.status.clone(), admin);
+        }
 
         (PaymentRefunded {
             payment_id,
@@ -5040,6 +5274,76 @@ impl PaymentContract {
 
         // Issue #674
         PaymentContract::invoke_payment_hooks(&env, PaymentEventType::Refunded, payment_id);
+
+        Ok(())
+    }
+
+    /// Refunds a completed payment from the merchant's own balance.
+    ///
+    /// Completed payments have already been settled out of the contract, so the
+    /// merchant returns `amount + tip` directly to the customer (#675) and the
+    /// payment moves `Completed → Refunded` (#682). Platform fees already
+    /// collected are not returned.
+    ///
+    /// # Arguments
+    /// * `merchant` - The payment's merchant (must authorize and fund the refund)
+    /// * `payment_id` - The ID of the completed payment
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `PaymentError::NotFound` if the payment does not exist,
+    /// `BasicError::Unauthorized` if `merchant` is not the payment's merchant, or
+    /// `PaymentError::InvalidStatus` if the payment is not `Completed`.
+    pub fn refund_completed_payment(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "refund_payment")?;
+        merchant.require_auth();
+
+        let mut payment: Payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        if payment.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if payment.status != PaymentStatus::Completed {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        let tip = PaymentContract::get_tip(&env, payment_id);
+        let refund_amount = payment.amount + tip;
+        if refund_amount > 0 {
+            token::Client::new(&env, &payment.token).transfer(
+                &merchant,
+                &payment.customer,
+                &refund_amount,
+            );
+        }
+
+        payment.status = PaymentStatus::Refunded;
+        payment.refunded_amount = payment.amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Refunded, merchant);
+
+        if tip > 0 {
+            (PaymentTipReturned {
+                payment_id,
+                customer: payment.customer.clone(),
+                tip_amount: tip,
+            })
+            .publish(&env);
+        }
+        (PaymentRefunded {
+            payment_id,
+            customer: payment.customer,
+            amount: payment.amount,
+        })
+        .publish(&env);
 
         Ok(())
     }
@@ -5094,11 +5398,18 @@ impl PaymentContract {
         // still-Pending payment before it becomes Cancelled. A payment with no
         // installment history transfers nothing.
         PaymentContract::return_collected_installments(env, &payment, payment_id);
+        PaymentContract::return_tip(env, &payment);
         PaymentContract::restore_spend_limit(env, &payment);
 
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(
+            env,
+            payment_id,
+            PaymentStatus::Cancelled,
+            caller.clone(),
+        );
 
         // Update analytics
         let mut analytics: PaymentAnalytics = env
@@ -6684,6 +6995,119 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Caps how many billing cycles a merchant's customers may skip per
+    /// subscription within a rolling year (#666). A cap of 0 disables skipping.
+    /// Without a configured cap, skips are unlimited.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant configuring the cap (must authorize)
+    /// * `max_skips_per_year` - Maximum skips per subscription per rolling 365 days
+    pub fn set_skip_cap(env: Env, merchant: Address, max_skips_per_year: u32) {
+        merchant.require_auth();
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::SkipCap(merchant.clone())),
+            &max_skips_per_year,
+        );
+        (SkipCapSet {
+            merchant,
+            max_skips_per_year,
+        })
+        .publish(&env);
+    }
+
+    /// Returns the merchant's skip cap, or `None` if skips are uncapped (#666).
+    pub fn get_skip_cap(env: Env, merchant: Address) -> Option<u32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::SkipCap(merchant)))
+    }
+
+    /// Returns the skips a subscription has used in its current rolling year (#666).
+    pub fn get_skip_usage(env: Env, subscription_id: u64) -> SubscriptionSkipUsage {
+        env.storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::SkipUsage(
+                subscription_id,
+            )))
+            .unwrap_or(SubscriptionSkipUsage {
+                window_start: 0,
+                count: 0,
+            })
+    }
+
+    /// Skips the next billing cycle of an active subscription without charging
+    /// (#666). `next_payment_at` advances by exactly one `interval`; the
+    /// subscription stays `Active`. Only the subscription's customer may skip.
+    ///
+    /// # Arguments
+    /// * `customer` - The subscription's customer (must authorize)
+    /// * `subscription_id` - The subscription to skip a cycle on
+    ///
+    /// # Returns
+    /// `Ok(new_next_payment_at)` on success, or `SubscriptionError::NotFound`,
+    /// `BasicError::Unauthorized`, `SubscriptionError::NotActive`, or
+    /// `SubscriptionError::SkipCapExceeded` if the merchant's yearly cap is used up.
+    pub fn skip_next_cycle(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.status != SubscriptionStatus::Active {
+            return Err(Error::Subscription(SubscriptionError::NotActive));
+        }
+
+        let now = env.ledger().timestamp();
+        let mut usage = PaymentContract::get_skip_usage(env.clone(), subscription_id);
+        if usage.count == 0 || now >= usage.window_start + SKIP_WINDOW_SECONDS {
+            usage = SubscriptionSkipUsage {
+                window_start: now,
+                count: 0,
+            };
+        }
+        if let Some(cap) = PaymentContract::get_skip_cap(env.clone(), sub.merchant.clone()) {
+            if usage.count >= cap {
+                return Err(Error::Subscription(SubscriptionError::SkipCapExceeded));
+            }
+        }
+        usage.count += 1;
+
+        let skipped_payment_at = sub.next_payment_at;
+        sub.next_payment_at += sub.interval;
+
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::SkipUsage(subscription_id)),
+            &usage,
+        );
+
+        (SubscriptionCycleSkipped {
+            subscription_id,
+            customer,
+            skipped_payment_at,
+            next_payment_at: sub.next_payment_at,
+            skips_used: usage.count,
+        })
+        .publish(&env);
+
+        Ok(sub.next_payment_at)
+    }
+
     /// Read a single subscription.
     pub fn get_subscription(env: Env, subscription_id: u64) -> Subscription {
         env.storage()
@@ -7774,11 +8198,11 @@ impl PaymentContract {
         match proposal.action_type {
             ActionType::CompletePayment => {
                 let payment_id = PaymentContract::read_u64_from_bytes(&proposal.data, 0);
-                PaymentContract::do_complete_payment(env, payment_id)?;
+                PaymentContract::do_complete_payment(env, payment_id, proposal.proposer.clone())?;
             }
             ActionType::RefundPayment => {
                 let payment_id = PaymentContract::read_u64_from_bytes(&proposal.data, 0);
-                PaymentContract::do_refund_payment(env, payment_id)?;
+                PaymentContract::do_refund_payment(env, payment_id, proposal.proposer.clone())?;
             }
             ActionType::AddAdmin => {
                 let new_admin = proposal.target.clone();
@@ -8842,7 +9266,7 @@ impl PaymentContract {
         let mut results = Vec::new(&env);
 
         for payment_id in payment_ids.iter() {
-            let result = PaymentContract::do_complete_payment(&env, payment_id);
+            let result = PaymentContract::do_complete_payment(&env, payment_id, admin.clone());
 
             match result {
                 Ok(()) => {
@@ -9067,6 +9491,12 @@ impl PaymentContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Payment(PaymentKey::Counter), &payment_id);
+            PaymentContract::record_status_change(
+                &env,
+                payment_id,
+                PaymentStatus::Pending,
+                entry.customer.clone(),
+            );
 
             // Index by customer
             let customer_count: u64 = env
@@ -9134,7 +9564,7 @@ impl PaymentContract {
             // the risk surcharge), finality-delay hold, payment forwarding,
             // loyalty accrual, fee-rebate accrual, auto-escrow and analytics
             // are all applied — identical to a normal payment completion.
-            match PaymentContract::do_complete_payment(&env, payment_id) {
+            match PaymentContract::do_complete_payment(&env, payment_id, admin.clone()) {
                 Ok(()) => results.push_back(BatchResult {
                     payment_id,
                     success: true,
@@ -9392,7 +9822,7 @@ impl PaymentContract {
         }
 
         // Complete the payment
-        PaymentContract::do_complete_payment(&env, payment_id)?;
+        PaymentContract::do_complete_payment(&env, payment_id, admin)?;
 
         Ok(())
     }
@@ -9434,7 +9864,8 @@ impl PaymentContract {
         if !condition_met {
             return Err(Error::Feature(FeatureError::ConditionNotMet));
         }
-        PaymentContract::do_complete_payment(&env, payment_id)
+        // Permissionless execution: the contract itself is the recorded actor.
+        PaymentContract::do_complete_payment(&env, payment_id, env.current_contract_address())
     }
 
     /// Retrieves the conditional payment record for a given payment ID.
@@ -10755,7 +11186,8 @@ impl PaymentContract {
         // Run the same completion path as a normal payment: platform fee
         // deduction (incl. risk surcharge), finality-delay hold, payment
         // forwarding, loyalty/rebate accrual, auto-escrow and analytics.
-        PaymentContract::do_complete_payment(&env, payment_id)?;
+        // Permissionless execution: the contract itself is the recorded actor.
+        PaymentContract::do_complete_payment(&env, payment_id, env.current_contract_address())?;
 
         proposal.executed = true;
         env.storage().instance().set(
@@ -11708,6 +12140,12 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Counter), &payment_id);
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            PaymentStatus::Pending,
+            customer.clone(),
+        );
 
         // Index by customer
         let customer_count: u64 = env
@@ -11977,9 +12415,11 @@ impl PaymentContract {
 
         // Mark payment as Completed to prevent subsequent complete_payment calls
         payment.status = PaymentStatus::Completed;
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::Data(payment_id)),
+            &payment,
+        );
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, admin);
 
         Ok(())
     }
@@ -12340,6 +12780,52 @@ impl PaymentContract {
         }
         limit.used = limit.used.saturating_sub(payment.amount).max(0);
         env.storage().instance().set(&key, &limit);
+    }
+
+    /// Appends a `(status, timestamp, actor)` entry to a payment's status
+    /// history (#682), dropping the oldest entry once `MAX_STATUS_HISTORY` is
+    /// reached. No extra event is emitted: each transition already publishes
+    /// its own lifecycle event (`PaymentCompleted`, `PaymentRefunded`, ...).
+    fn record_status_change(env: &Env, payment_id: u64, status: PaymentStatus, actor: Address) {
+        let key = DataKey::Payment(PaymentKey::StatusHistory(payment_id));
+        let mut history: Vec<PaymentStatusEntry> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if history.len() >= MAX_STATUS_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(PaymentStatusEntry {
+            status,
+            timestamp: env.ledger().timestamp(),
+            actor,
+        });
+        env.storage().instance().set(&key, &history);
+    }
+
+    fn get_tip(env: &Env, payment_id: u64) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Tip(payment_id)))
+            .unwrap_or(0)
+    }
+
+    /// Returns a pending payment's escrowed tip to the customer (#675). The tip
+    /// record is kept so `get_payment_tip` still reports what was tipped.
+    fn return_tip(env: &Env, payment: &Payment) {
+        let tip = PaymentContract::get_tip(env, payment.id);
+        if tip <= 0 {
+            return;
+        }
+        let token_client = token::Client::new(env, &payment.token);
+        token_client.transfer(&env.current_contract_address(), &payment.customer, &tip);
+        (PaymentTipReturned {
+            payment_id: payment.id,
+            customer: payment.customer.clone(),
+            tip_amount: tip,
+        })
+        .publish(env);
     }
 
     // ── SUBSCRIPTION GROUPS (#218) ────────────────────────────────────────────
@@ -13711,3 +14197,6 @@ mod test_glossary;
 
 #[cfg(test)]
 mod test_routed_payment;
+
+#[cfg(test)]
+mod test_skip_tip_status_history;

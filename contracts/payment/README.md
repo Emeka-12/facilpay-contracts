@@ -49,6 +49,61 @@ The payment contract is the core of the FacilPay platform. It handles the full l
 | `is_payment_expired(payment_id)`                                                             | Returns `true` if the payment's expiration timestamp has passed.                                                                                             |
 | `update_payment_notes(admin, payment_id, notes)`                                             | Admin updates free-text notes on a payment.                                                                                                                  |
 
+### Tips
+
+| Function                                   | Description                                                                                                                         |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `add_tip(customer, payment_id, tip_amount)` | Customer adds a fee-exempt tip to their own `Pending` payment. The tip is transferred into the contract immediately. Returns the payment's total tip. |
+| `get_payment_tip(payment_id)`              | Returns the total tip attached to a payment (`0` if none).                                                                          |
+| `refund_completed_payment(merchant, payment_id)` | Merchant refunds a `Completed` payment from their own balance, returning `amount + tip` to the customer and marking it `Refunded`. |
+
+#### How Tips Work
+
+- **Parameters.** `customer` must be the payment's customer and must authorize. `tip_amount` is in base
+  units of the payment's token and must be `> 0`. Calling `add_tip` again adds to the existing tip.
+- **Escrow.** The tip moves from the customer to the contract as soon as `add_tip` succeeds and is held
+  there until the payment reaches a terminal state.
+- **Fee-exempt settlement.** When the payment completes (`complete_payment`, `complete_batch_payment`,
+  `complete_conditional_payment`, `execute_if_condition_met`, `execute_large_payment`, a multi-sig
+  `CompletePayment` proposal, or the last `pay_installment`), platform fees and risk surcharges are
+  computed on `amount` only. The merchant receives `net_amount + tip`, respecting their payout schedule
+  and the finality delay. Payment forwarding applies only to the non-tip portion.
+- **Returns.** `refund_payment`, a `partial_refund` that fully refunds the payment, `cancel_payment` and
+  `expire_payment` return the whole tip to the customer. `refund_completed_payment` returns `amount + tip`
+  from the merchant's balance. Platform fees already collected are not returned.
+- **Restrictions.** Tips can't be added to escrow-bridged payments (`create_escrowed_payment`) or split
+  payments (`create_split_payment`), because those payments settle outside the standard completion path.
+- **Errors.** `add_tip` returns `BasicError::InvalidAmount` (tip ≤ 0), `PaymentError::NotFound`,
+  `BasicError::Unauthorized` (caller isn't the customer), `PaymentError::Expired`, or
+  `PaymentError::InvalidStatus` (payment isn't `Pending`, or is escrowed/split).
+  `refund_completed_payment` returns `PaymentError::NotFound`, `BasicError::Unauthorized` (caller isn't
+  the merchant) or `PaymentError::InvalidStatus` (payment isn't `Completed`).
+
+### Payment Status History
+
+| Function                                 | Description                                                                                     |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `get_payment_status_history(payment_id)` | Returns the payment's `Vec<PaymentStatusEntry>` in chronological order (empty if unknown).     |
+
+Every payment status change appends a `PaymentStatusEntry { status, timestamp, actor }`, starting with
+`Pending` at creation. `timestamp` is the ledger timestamp. `actor` is the address that caused the
+transition, as follows:
+
+- the customer for creation;
+- the admin for `complete_payment`, `refund_payment` and `partial_refund`;
+- the canceller for `cancel_payment`;
+- the merchant for `refund_completed_payment`;
+- the proposer for multi-sig `CompletePayment` / `RefundPayment` proposals;
+- the payer of the final installment.
+
+Permissionless transitions (`expire_payment`, `finalize_installment_payment`, `execute_large_payment`,
+`execute_if_condition_met`) record the contract's own address as `actor`. Only real status changes are
+recorded, so repeated partial refunds that stay `PartialRefunded` add no entries.
+A payment that is completed and then refunded therefore shows three entries:
+`Pending → Completed → Refunded`. History is capped at `MAX_STATUS_HISTORY` (10) entries per payment,
+and the oldest entry is dropped beyond that. No additional event is emitted; each transition already
+publishes its own lifecycle event.
+
 ### Queries & Pagination
 
 | Function                                   | Description                                                |
@@ -213,6 +268,25 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 | `get_subscriptions_by_customer(customer, page)`                                                                                     | Paginated list of subscription IDs for a customer.                                                              |
 | `get_subscriptions_by_merchant(merchant, page)`                                                                                     | Paginated list of subscription IDs for a merchant.                                                              |
 | `get_merchant_subscriptions(merchant, page)`                                                                                        | Alternative paginated index of subscription IDs for a merchant.                                                 |
+
+#### Skipping a Billing Cycle
+
+| Function                                      | Description                                                                                          |
+| --------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `skip_next_cycle(customer, subscription_id)`  | Customer skips the next billing cycle without being charged. Returns the new `next_payment_at`.       |
+| `set_skip_cap(merchant, max_skips_per_year)`  | Merchant caps skips per subscription per rolling 365-day window. `0` disables skipping.              |
+| `get_skip_cap(merchant)`                      | Returns the merchant's cap, or `None` when skips are uncapped (the default).                         |
+| `get_skip_usage(subscription_id)`             | Returns `SubscriptionSkipUsage { window_start, count }` for the current window.                      |
+
+- `skip_next_cycle` advances `next_payment_at` by exactly one `interval`, so the skipped due date is no
+  longer billable. No tokens move, `payment_count` is unchanged and the subscription stays `Active`.
+  Unlike `pause_subscription`, which is open-ended, a skip affects exactly one cycle.
+- Only the subscription's `customer` may skip, and only while the subscription is `Active`.
+- Skips are counted per subscription over a rolling window of `SKIP_WINDOW_SECONDS` (365 days). The
+  window starts at the first skip and resets on the first skip at or after `window_start + 365 days`.
+- **Errors:** `SubscriptionError::NotFound`, `BasicError::Unauthorized` (caller isn't the customer),
+  `SubscriptionError::NotActive` (paused, in dunning, cancelled, …), and
+  `SubscriptionError::SkipCapExceeded` (319) once the merchant's cap for the window is used up.
 
 #### How Free Trials Work
 
@@ -950,6 +1024,8 @@ Key types referenced by the functions above:
 - **`MeteredSubscription`** — usage-based subscription record: `subscription_id`, `merchant`, `customer`, `token`, `price_per_unit`, `unit_name`, `accumulated_units`, `billing_cap`, `last_reset_at`, `max_units_per_period`.
 - **`PaymentChannel`** — off-chain channel state including deposited balance and settlement nonce.
 - **`MultiSigConfig`** — admin list, required signatures, and proposal TTL.
+- **`PaymentStatusEntry`** — `status`, `timestamp`, `actor`; one entry per payment status change.
+- **`SubscriptionSkipUsage`** — `window_start`, `count`; skips used in the current rolling year.
 
 ---
 
@@ -970,6 +1046,14 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `PaymentHookRegistered`       | `PaymentHookRegistered`       | `hook_id`, `subscriber`, `event_count`                    | `register_payment_hook()` succeeds                                                    |
 | `PaymentHookDeregistered`     | `PaymentHookDeregistered`     | `hook_id`, `subscriber`                                   | `deregister_payment_hook()` deactivates a hook                                        |
 | `PaymentHookInvocationFailed` | `PaymentHookInvocationFailed` | `hook_id`, `subscriber`, `event_type`, `payment_id`       | A subscriber contract panicked or returned an error during hook invocation            |
+
+### Tip Events
+
+| Event                | Topic Name           | Payload Fields                           | Fires When                                                                                         |
+| -------------------- | -------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `PaymentTipAdded`    | `PaymentTipAdded`    | `payment_id`, `tip_amount`               | `add_tip()` escrows a tip                                                                          |
+| `PaymentTipSettled`  | `PaymentTipSettled`  | `payment_id`, `merchant`, `tip_amount`   | A tipped payment completes and the tip is included in the merchant's settlement                    |
+| `PaymentTipReturned` | `PaymentTipReturned` | `payment_id`, `customer`, `tip_amount`   | A tipped payment is refunded, fully partial-refunded, cancelled, expired or `refund_completed_payment` runs |
 
 ### Installment Payment Events
 
@@ -1008,6 +1092,8 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `TrialCancelled`              | `TrialCancelled`              | `subscription_id`, `cancelled_at`                                               | `cancel_subscription()` called during trial period                              |
 | `SubscriptionPaused`          | `SubscriptionPaused`          | `subscription_id`                                                               | `pause_subscription()` pauses billing                                           |
 | `SubscriptionResumed`         | `SubscriptionResumed`         | `subscription_id`, `next_payment_at`                                            | `resume_subscription()` resumes without proration                               |
+| `SubscriptionCycleSkipped`    | `SubscriptionCycleSkipped`    | `subscription_id`, `customer`, `skipped_payment_at`, `next_payment_at`, `skips_used` | `skip_next_cycle()` skips one billing cycle                              |
+| `SkipCapSet`                  | `SkipCapSet`                  | `merchant`, `max_skips_per_year`                                                | `set_skip_cap()` configures the merchant's skip cap                             |
 | `SubscriptionResumedProrated` | `SubscriptionResumedProrated` | `subscription_id`, `pause_duration`, `new_next_billing_date`, `prorated_amount` | `resume_subscription()` with `proration_enabled=true` adjusts next billing date |
 
 ### Metered Billing Events
@@ -1127,7 +1213,7 @@ Errors are grouped into five ranges:
 | ------- | -------------------------------------------------------------- |
 | 100–126 | `BasicError` — auth, metadata, rate limits, multi-sig setup    |
 | 200–224 | `PaymentError` — payment lifecycle violations                  |
-| 300–318 | `SubscriptionError` — subscription and dunning violations      |
+| 300–319 | `SubscriptionError` — subscription, dunning and skip-cap violations |
 | 400–406 | `ProposalError` — multi-sig proposal violations                |
 | 500–540 | `FeatureError` — channels, splits, loyalty, escrow, forwarding |
 
